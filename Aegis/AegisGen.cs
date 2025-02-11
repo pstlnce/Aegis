@@ -200,6 +200,10 @@ internal sealed class AegisGen : IIncrementalGenerator
 
             sourceCode.Append('\n');
 
+            AppendReadList3(sourceCode, type, token);
+
+            sourceCode.Append('\n');
+
             if (token.IsCancellationRequested) return;
 
             AppendReadList2(sourceCode, type, token);
@@ -644,6 +648,69 @@ internal sealed class AegisGen : IIncrementalGenerator
             return result;
         }");
     }
+
+    internal static void AppendReadList3(StringBuilder sourceCode, ITypeSymbol type, CancellationToken token = default)
+    {
+        sourceCode.AppendFormat(@"
+        internal static List<{0}> ReadList3<TReader>(TReader reader)
+            where TReader : IDataReader
+        {{
+            var result = new List<{0}>();
+
+            ReadSchemaIndexes(reader", type.Name);
+
+
+        foreach (var member in type.GetMembers())
+        {
+            if (token.IsCancellationRequested) return;
+
+            if (!TryGetSettableProperty(member, out var property))
+                continue;
+
+            sourceCode.AppendFormat(", out var col{0}", property.Name);
+        }
+
+        sourceCode.Append(");\n");
+
+        sourceCode.AppendFormat(@"
+            while(reader.Read())
+            {{
+                var parsed = new {0}();", type.Name);
+
+        sourceCode.Append('\n');
+
+        foreach (var member in type.GetMembers())
+        {
+            if (token.IsCancellationRequested) return;
+
+            if (!TryGetSettableProperty(member, out var property))
+                continue;
+
+            var propertyType = property.Type.ToDisplayString();
+
+            if (property.Type.IsReferenceType)
+            {
+                sourceCode.AppendFormat(@"
+                if(col{0} != -1) parsed.{0} = reader[col{0}] as {1};", property.Name, propertyType);
+            }
+            else
+            {
+                sourceCode.AppendFormat(@"
+                if(col{0} != -1 && reader[col{0}] is {1} p{0}) parsed.{0} = p{0};", property.Name, propertyType);
+            }
+        }
+
+        sourceCode.Append('\n');
+
+        sourceCode.Append(@"
+
+                result.Add(parsed);
+            }
+            
+            return result;
+        }");
+    }
+
 
     internal static void AppendReadSchemaIndexes(StringBuilder sourceCode, ITypeSymbol type, CancellationToken token = default)
     {
