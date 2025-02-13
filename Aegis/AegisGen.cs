@@ -6,11 +6,13 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Linq;
 using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Xml.Linq;
 
 namespace Aegis;
 
@@ -23,7 +25,6 @@ internal sealed class AegisConverterAttribute : Attribute
         Expression = expression;
     }
 }
-
 
 [Generator]
 internal sealed class AegisGen : IIncrementalGenerator
@@ -117,8 +118,6 @@ internal sealed class AegisGen : IIncrementalGenerator
                 namespaceAdded = true;
             }
 
-            if (token.IsCancellationRequested) return;
-
             if (namespaceAdded)
             {
                 sourceCode.Append('{');
@@ -126,120 +125,24 @@ internal sealed class AegisGen : IIncrementalGenerator
 
             sourceCode.AppendFormat(@"
     public sealed partial class {0}AegisAgent
-    {{
-        internal static IEnumerable<{0}> Read<TReader>(TReader reader)
-            where TReader : DbDataReader
-        {{
-            var schema = reader.GetColumnSchema();
+    {{", type.Name);
 
-            ReadSchema(schema", type.Name);
+            IEnumerable<Action> methods = [
+                () => AppendReadList(sourceCode, type, token),
+                () => AppendReadSchemaIndexes(sourceCode, type, token),
+                () => AppendReadSchemaColumnIndex(sourceCode, type, matchCase, token),
+            ];
 
-            foreach (var member in type.GetMembers())
+            var first = true;
+            foreach (var method in methods)
             {
+                if(first) first = false;
+                else sourceCode.Append('\n');
+
                 if (token.IsCancellationRequested) return;
 
-                if (!TryGetSettableProperty(member, out var property))
-                    continue;
-
-                sourceCode.AppendFormat(", out var col{0}, out var f{0}", property.Name);
+                method();
             }
-
-            sourceCode.Append(");\n");
-
-            sourceCode.Append(@"
-            while(reader.Read())
-            {");
-
-            foreach (var property in type.GetSettableProperties())
-            {
-                if (token.IsCancellationRequested) return;
-
-                var propertyType = property.Type.ToDisplayString();
-
-                sourceCode.AppendFormat(@"
-                var v{0} = f{0} && reader[col{0}] is {1} p{0} ? p{0} : default({1});", property.Name, propertyType);
-            }
-            
-            sourceCode.Append('\n');
-
-            sourceCode.AppendFormat(@"
-                var parsed = new {0}()
-                {{", type.Name);
-
-            var writedFirst = false;
-
-            foreach (var property in type.GetSettableProperties())
-            {
-                if (token.IsCancellationRequested) return;
-
-                if (writedFirst) sourceCode.Append(',');
-                writedFirst = true;
-
-                sourceCode.AppendFormat(@"
-                    {0} = v{0}", property.Name);
-            }
-
-            sourceCode.Append(@"
-                };
-
-                yield return parsed;
-            }
-        }");
-
-            sourceCode.Append('\n');
-
-            if (token.IsCancellationRequested) return;
-
-            AppendReadList(sourceCode, type, token);
-
-            if (token.IsCancellationRequested) return;
-
-            sourceCode.Append('\n');
-
-            AppendReadSingleItemStream(sourceCode, type, token);
-
-            sourceCode.Append('\n');
-
-            AppendReadList3(sourceCode, type, token);
-
-            sourceCode.Append('\n');
-
-            if (token.IsCancellationRequested) return;
-
-            AppendReadList2(sourceCode, type, token);
-
-            if (token.IsCancellationRequested) return;
-
-            sourceCode.Append('\n');
-
-            AppendReadSchemaColumnIndex2(sourceCode, type, matchCase, token);
-
-            sourceCode.Append('\n');
-
-            if (token.IsCancellationRequested) return;
-
-            AppendReadSchemaIndexes(sourceCode, type, token);
-
-            sourceCode.Append('\n');
-
-            if (token.IsCancellationRequested) return;
-
-            AppendReadSchemaColumnIndex(sourceCode, type, matchCase, token);
-
-            sourceCode.Append('\n');
-
-            if (token.IsCancellationRequested) return;
-
-            AppendReadSchema(sourceCode, type, token);
-
-            if (token.IsCancellationRequested) return;
-
-            sourceCode.Append('\n');
-
-            // todo: Provide attribute's values
-            AppendReadSchemaColumn(sourceCode, type, matchCase, token);
-
-            if (token.IsCancellationRequested) return;
 
             sourceCode.Append(@"
     }");
@@ -260,399 +163,10 @@ internal sealed class AegisGen : IIncrementalGenerator
         }
     }
 
-    internal static void AppendReadList2(StringBuilder sourceCode, ITypeSymbol type, CancellationToken token = default)
-    {
-        sourceCode.AppendFormat(@"
-        internal static List<{0}> ReadList2<TReader>(TReader reader)
-            where TReader : IDataReader
-        {{
-            var result = new List<{0}>();", type.Name);
-
-        var propertiesCount = 0;
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-                sourceCode.AppendFormat(@"
-            {1} v{2} = default({1});
-            ref {1} v{0} = ref v{2};
-            int ind{0} = 0;", propertiesCount, "object", property.Name);
-
-            sourceCode.Append('\n');
-
-            propertiesCount++;
-        }
-
-
-        sourceCode.Append(@"
-            int qCurrent = -1;
-
-            {");
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            var propertyType = property.Type.ToDisplayString();
-
-            sourceCode.AppendFormat(@"
-                bool f{0} = false;", property.Name);
-        }
-
-        sourceCode.Append('\n');
-
-        sourceCode.Append(@"
-                var fields = reader.FieldCount;
-
-                for(int i = 0; i != fields; i++)
-                {");
-
-        sourceCode.Append(@"
-                    var d = ReadSchemaColumnIndex2(reader.GetName(i)");
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            var propertyType = property.Type.ToDisplayString();
-
-            sourceCode.AppendFormat(", ref f{0}", property.Name);
-        }
-
-        sourceCode.Append(@");
-                    if(d == -1) continue;
-
-                    qCurrent += 1;
-
-                    switch(qCurrent)
-                    {");
-
-        var map = new StringBuilder();
-        map.Append(@"ref (");
-
-        var propI = 0;
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            if (propI != 0)
-            {
-                map.Append(" : ");
-            }
-
-            if(propI != (propertiesCount - 1))
-            {
-                if(propI > 0)
-                {
-                    map.Append("ref (");
-                }
-
-                map.AppendFormat("d == {0} ? ref v{1}", propI, property.Name);
-            }
-            else
-            {
-                map.AppendFormat("ref v{0}", property.Name);
-                map.Append(')', propertiesCount - 1);
-            }
-
-            propI++;
-        }
-
-        var mapString = map.ToString();
-
-        int propertyId = 0;
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            var propertyType = property.Type.ToDisplayString();
-
-            if(propertiesCount - 1 != propertyId)
-            {
-                sourceCode.AppendFormat(@"
-                        case {0}:
-                            v{0} = {1};
-                            ind{0} = i;
-                            break;", propertyId, map);
-            }
-            else
-            {
-                sourceCode.AppendFormat(@"
-                        default:
-                            v{0} = {1};
-                            ind{0} = i;
-                            break;", propertyId, map);
-            }
-
-            propertyId++;
-        }
-
-        sourceCode.Append(@"
-                    }");
-
-        sourceCode.Append(@"
-                }");
-
-        sourceCode.Append(@"
-            }");
-
-        sourceCode.Append('\n');
-
-        sourceCode.Append(@"
-            if(qCurrent == -1)
-            {
-                return result;
-            }
-
-            while(reader.Read())
-            {
-                switch(qCurrent)
-                {");
-
-        for(int i = propertiesCount - 1; i >= 0; i--)
-        {
-            if(i > 1)
-            {
-                sourceCode.AppendFormat(@"
-                    case {0}:
-                        v{0} = reader[ind{0}];
-                        goto case {1};", i, i - 1);
-            }
-            else if (i == 1)
-            {
-                sourceCode.AppendFormat(@"
-                    case {0}:
-                        v{0} = reader[ind{0}];
-                        goto default;", i);
-            }
-            else
-            {
-                sourceCode.AppendFormat(@"
-                    default:
-                        v{0} = reader[ind{0}];
-                        break;", i);
-            }
-        }
-
-        sourceCode.Append(@"
-                }");
-
-        sourceCode.Append('\n');
-
-        sourceCode.AppendFormat(@"
-                var parsed = new {0}()
-                {{", type.Name);
-
-        var writedFirst = false;
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            if (writedFirst) sourceCode.Append(',');
-            writedFirst = true;
-
-            var propertyType = property.Type.ToDisplayString();
-
-            if (property.Type.IsReferenceType)
-            {
-                sourceCode.AppendFormat(@"
-                    {0} = v{0} as {1}", property.Name, propertyType);
-            }
-            else
-            {
-                sourceCode.AppendFormat(@"
-                    {0} = v{0} is {1} p{0} ? p{0} : default({1})", property.Name, propertyType);
-            }
-        }
-
-        sourceCode.Append(@"
-                };
-
-                result.Add(parsed);
-            }
-            
-            return result;
-        }");
-    }
-
-    internal static void AppendReadSingleItemStream(StringBuilder sourceCode, ITypeSymbol type, CancellationToken token = default)
-    {
-        sourceCode.AppendFormat(@"
-        internal static IEnumerable<{0}> ReadSingleItemStream<TReader>(TReader reader)
-            where TReader : IDataReader
-        {{
-            {0} parsed = default({0});
-            ReadSchemaIndexes(reader", type.Name);
-
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            sourceCode.AppendFormat(", out var col{0}", property.Name);
-        }
-
-        sourceCode.Append(");\n");
-
-        sourceCode.Append(@"
-            while(reader.Read())
-            {");
-
-        sourceCode.Append('\n');
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            var propertyType = property.Type.ToDisplayString();
-
-            if (property.Type.IsReferenceType)
-            {
-                sourceCode.AppendFormat(@"
-                var v{0} = col{0} != -1 ? reader[col{0}] as {1} : default({1});", property.Name, propertyType);
-            }
-            else
-            {
-                sourceCode.AppendFormat(@"
-                var v{0} = col{0} != -1 && reader[col{0}] is {1} p{0} ? p{0} : default({1});", property.Name, propertyType);
-            }
-        }
-
-        sourceCode.Append('\n');
-
-        sourceCode.AppendFormat(@"
-                parsed ??= new {0}();", type.Name);
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            sourceCode.AppendFormat(@"
-                parsed.{0} = v{0};", property.Name);
-        }
-
-        sourceCode.Append(@"
-                yield return parsed;
-            }
-        }");
-    }
-
     internal static void AppendReadList(StringBuilder sourceCode, ITypeSymbol type, CancellationToken token = default)
     {
         sourceCode.AppendFormat(@"
         internal static List<{0}> ReadList<TReader>(TReader reader)
-            where TReader : IDataReader
-        {{
-            var result = new List<{0}>();
-
-            ReadSchemaIndexes(reader", type.Name);
-
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            sourceCode.AppendFormat(", out var col{0}", property.Name);
-        }
-
-        sourceCode.Append(");\n");
-
-        sourceCode.Append(@"
-            while(reader.Read())
-            {");
-
-        sourceCode.Append('\n');
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            var propertyType = property.Type.ToDisplayString();
-
-            if (property.Type.IsReferenceType)
-            {
-                sourceCode.AppendFormat(@"
-                var v{0} = col{0} != -1 ? reader[col{0}] as {1} : default({1});", property.Name, propertyType);
-            }
-            else
-            {
-                sourceCode.AppendFormat(@"
-                var v{0} = col{0} != -1 && reader[col{0}] is {1} p{0} ? p{0} : default({1});", property.Name, propertyType);
-            }
-        }
-
-        sourceCode.Append('\n');
-
-        sourceCode.AppendFormat(@"
-                var parsed = new {0}()
-                {{", type.Name);
-
-        var writedFirst = false;
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            if (writedFirst) sourceCode.Append(',');
-            writedFirst = true;
-
-            sourceCode.AppendFormat(@"
-                    {0} = v{0}", property.Name);
-        }
-
-        sourceCode.Append(@"
-                };
-
-                result.Add(parsed);
-            }
-            
-            return result;
-        }");
-    }
-
-    internal static void AppendReadList3(StringBuilder sourceCode, ITypeSymbol type, CancellationToken token = default)
-    {
-        sourceCode.AppendFormat(@"
-        internal static List<{0}> ReadList3<TReader>(TReader reader)
             where TReader : IDataReader
         {{
             var result = new List<{0}>();
@@ -710,7 +224,6 @@ internal sealed class AegisGen : IIncrementalGenerator
             return result;
         }");
     }
-
 
     internal static void AppendReadSchemaIndexes(StringBuilder sourceCode, ITypeSymbol type, CancellationToken token = default)
     {
@@ -771,180 +284,6 @@ internal sealed class AegisGen : IIncrementalGenerator
             }
         }");
     }
-
-    internal static void AppendReadSchemaColumnIndex2(StringBuilder sourceCode, ITypeSymbol type, int matchCases, CancellationToken token = default)
-    {
-        if (token.IsCancellationRequested) return;
-
-        sourceCode.Append(@"
-        internal static int ReadSchemaColumnIndex2(string c");
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            sourceCode.AppendFormat(
-                ", ref bool f{0}",
-                property.Name
-            );
-        }
-
-        if (token.IsCancellationRequested) return;
-
-        sourceCode.Append(@")
-        {");
-
-        var namesToMatch = new SortedDictionary<int, List<(string name, IPropertySymbol property, int id)>>();
-        var names = new List<string>();
-
-        int id = -1;
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            ++id;
-
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase))
-            {
-                var lowerCase =
-                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.MatchOriginal) ||
-                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Camel) ||
-                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Pascal)
-                    ? property.Name.ToLower()
-                    : null;
-
-                if (lowerCase != null)
-                {
-                    if (!namesToMatch.TryGetValue(lowerCase.Length, out var sameLength))
-                    {
-                        namesToMatch[lowerCase.Length] = sameLength = [];
-                    }
-
-                    sameLength.Add((lowerCase, property, id));
-                }
-
-                var snake = MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Snake)
-                    ? MatchCaseGenerator.ToSnakeCase(property.Name)
-                    : null;
-
-                if (snake != null && snake != lowerCase)
-                {
-                    if (!namesToMatch.TryGetValue(snake.Length, out var sameLength))
-                    {
-                        namesToMatch[snake.Length] = sameLength = [];
-                    }
-
-                    sameLength.Add((snake, property, id));
-                }
-
-                continue;
-            }
-
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.MatchOriginal))
-            {
-                var original = property.Name;
-                names.Add(original);
-            }
-
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Snake))
-            {
-                var snake = MatchCaseGenerator.ToSnakeCase(property.Name);
-                if (!names.Contains(snake)) names.Add(snake);
-            }
-
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Camel))
-            {
-                var camel = MatchCaseGenerator.ToCamelCase(property.Name);
-                if (!names.Contains(camel)) names.Add(camel);
-            }
-
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Pascal))
-            {
-                var pascal = MatchCaseGenerator.ToPascalCase(property.Name);
-                if (!names.Contains(pascal)) names.Add(pascal);
-            }
-
-            foreach (var nameCase in names)
-            {
-                if (!namesToMatch.TryGetValue(nameCase.Length, out var sameLength))
-                {
-                    namesToMatch[nameCase.Length] = sameLength = [];
-                }
-
-                sameLength.Add((nameCase, property, id));
-            }
-
-            names.Clear();
-        }
-
-        sourceCode.Append(@"
-            switch(c.Length)
-            {");
-
-        foreach (var sameLengthNames in namesToMatch)
-        {
-            if (token.IsCancellationRequested) return;
-
-            var length = sameLengthNames.Key;
-
-            sourceCode.AppendFormat(@"
-                case {0}:", length);
-
-            bool writedFirst = false;
-
-            foreach (var (name, property, propertyId) in sameLengthNames.Value)
-            {
-                if (writedFirst)
-                {
-                    sourceCode.Append('\n');
-                }
-
-                writedFirst = true;
-
-                sourceCode.AppendFormat(@"
-                    if(!f{0} && string.Equals(c, ""{1}""", property.Name, name);
-
-                if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase))
-                {
-                    sourceCode.Append(", StringComparison.OrdinalIgnoreCase");
-                }
-
-                sourceCode.Append(')');
-
-                sourceCode.Append(@")
-                    {");
-
-                sourceCode.AppendFormat(@"
-                        f{0} = true;
-                        return {1};", property.Name, propertyId);
-
-                sourceCode.Append(@"
-                    }");
-            }
-
-            sourceCode
-                .Append(@"
-                    break;")
-                .Append('\n');
-        }
-
-        sourceCode.Append(@"
-                default:
-                    return -1;
-                    break;
-            }
-
-            return -1;
-        }");
-    }
-
 
     internal static void AppendReadSchemaColumnIndex(StringBuilder sourceCode, ITypeSymbol type, int matchCases, CancellationToken token = default)
     {
@@ -1069,8 +408,14 @@ internal sealed class AegisGen : IIncrementalGenerator
 
             bool writedFirst = false;
 
-            foreach (var (name, property) in sameLengthNames.Value)
+            sameLengthNames.Value.Sort((x, y) => StringComparer.OrdinalIgnoreCase.Compare(x.name, y.name));
+
+            int i = 0;
+
+            for(; i < sameLengthNames.Value.Count; i++)
             {
+                var (name, property) = sameLengthNames.Value[i];
+
                 if (writedFirst)
                 {
                     sourceCode.Append('\n');
@@ -1110,265 +455,6 @@ internal sealed class AegisGen : IIncrementalGenerator
                     break;
             }
         }");
-    }
-
-    internal static void AppendReadSchema(StringBuilder sourceCode, ITypeSymbol type, CancellationToken token = default)
-    {
-        if (token.IsCancellationRequested) return;
-
-        sourceCode.Append(@"
-        internal static void ReadSchema(ReadOnlyCollection<DbColumn> schema");
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            sourceCode.AppendFormat(
-                ", out string column{0}, out bool finded{0}",
-                property.Name
-            );
-        }
-
-        sourceCode.Append(@")
-        {");
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-            sourceCode.AppendFormat(@"
-            column{0} = default;
-            finded{0} = false;",
-            property.Name);
-        }
-
-        sourceCode.Append('\n');
-
-        sourceCode.Append(@"
-            foreach (var column in schema)
-            {
-                ReadSchemaColumn(column");
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            sourceCode.AppendFormat(
-                ", ref column{0}, ref finded{0}",
-                property.Name
-            );
-        }
-
-        sourceCode.Append(@");
-            }
-        }");
-    }
-
-    internal static void AppendReadSchemaColumn(StringBuilder sourceCode, ITypeSymbol type, int matchCases, CancellationToken token = default)
-    {
-        if (token.IsCancellationRequested) return;
-
-        sourceCode.Append(@"
-        internal static void ReadSchemaColumn(DbColumn column");
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            sourceCode.AppendFormat(
-                ", ref string column{0}, ref bool finded{0}",
-                property.Name
-            );
-        }
-
-        if (token.IsCancellationRequested) return;
-
-        sourceCode.Append(@")
-        {");
-
-        var namesToMatch = new SortedDictionary<int, List<(string name, IPropertySymbol property)>>();
-        var names = new List<string>();
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            if(MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase))
-            {
-                var lowerCase =
-                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.MatchOriginal) ||
-                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Camel) ||
-                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Pascal)
-                    ? property!.Name.ToLower()
-                    : null;
-
-                if(lowerCase != null)
-                {
-                    if (!namesToMatch.TryGetValue(lowerCase.Length, out var sameLength))
-                    {
-                        namesToMatch[lowerCase.Length] = sameLength = [];
-                    }
-
-                    sameLength.Add((lowerCase, property));
-                }
-
-                var snake = MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Snake)
-                    ? MatchCaseGenerator.ToSnakeCase(property.Name)
-                    : null;
-
-                if(snake != null && snake != lowerCase)
-                {
-                    if (!namesToMatch.TryGetValue(snake.Length, out var sameLength))
-                    {
-                        namesToMatch[snake.Length] = sameLength = [];
-                    }
-
-                    sameLength.Add((snake, property));
-                }
-
-                continue;
-            }
-
-            if(MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.MatchOriginal))
-            {
-                var original = property.Name;
-                names.Add(original);
-            }
-
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Snake))
-            {
-                var snake = MatchCaseGenerator.ToSnakeCase(property.Name);
-                if (!names.Contains(snake)) names.Add(snake);
-            }
-
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Camel))
-            {
-                var camel = MatchCaseGenerator.ToCamelCase(property.Name);
-                if (!names.Contains(camel)) names.Add(camel);
-            }
-
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Pascal))
-            {
-                var pascal = MatchCaseGenerator.ToPascalCase(property.Name);
-                if (!names.Contains(pascal)) names.Add(pascal);
-            }
-
-            foreach(var nameCase in names)
-            {
-                if(!namesToMatch.TryGetValue(nameCase.Length, out var sameLength))
-                {
-                    namesToMatch[nameCase.Length] = sameLength = [];
-                }
-
-                sameLength.Add((nameCase, property));
-            }
-
-            names.Clear();
-        }
-
-        sourceCode.Append(@"
-            string c = column.ColumnName;
-
-            switch(c.Length)
-            {");
-
-        foreach (var sameLengthNames in namesToMatch)
-        {
-            if (token.IsCancellationRequested) return;
-
-            var length = sameLengthNames.Key;
-
-            sourceCode.AppendFormat(@"
-                case {0}:", length);
-
-            bool writedFirst = false;
-
-            foreach(var (name, property) in sameLengthNames.Value)
-            {
-                if (writedFirst)
-                {
-                    sourceCode.Append('\n');
-                }
-
-                writedFirst = true;
-
-                sourceCode.AppendFormat(@"
-                    if(finded{0} == false && string.Equals(c, ""{1}""", property.Name, name);
-
-                if(MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase))
-                {
-                    sourceCode.Append(", StringComparison.OrdinalIgnoreCase");
-                }
-                
-                sourceCode.Append(')');
-
-                sourceCode.Append(@")
-                    {");
-
-                sourceCode.AppendFormat(@"
-                        finded{0} = true;
-                        column{0} = c;
-                        return;", property.Name);
-
-                sourceCode.Append(@"
-                    }");
-            }
-
-            sourceCode
-                .Append(@"
-                    break;")
-                .Append('\n');
-        }
-
-        sourceCode.Append(@"
-                default:
-                    break;
-            }
-        }");
-    }
-
-    internal static void AppendReadSingle(StringBuilder sourceCode, ITypeSymbol type, CancellationToken token = default)
-    {
-        sourceCode.Append(@"
-        internal static {0} ReadSingle<TReader>(TReader reader)
-            where TReader : System.Data.Common.DbDataReader
-        {
-");
-    }
-
-    internal static void AppendPropertiesFilling(StringBuilder sourceCode, ImmutableArray<ISymbol> members, CancellationToken token = default)
-    {
-        var writedFirst = false;
-
-        foreach (var member in members)
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-            
-            if (writedFirst) sourceCode.Append(',');
-            writedFirst = true;
-
-            var propertyType = property.Type.ToDisplayString();
-
-            sourceCode.AppendFormat(@"
-                    {0} = reader[""{0}""] is {1} p{0} ? p{0} : default", property.Name, propertyType);
-        }
     }
 
     internal static bool TryGetSettableProperty(ISymbol? member, [NotNullWhen(true)] out IPropertySymbol? settableProperty)
@@ -1663,6 +749,7 @@ internal static class SymbolExtensions
     }
 }
 
+#if false
 internal struct AutoIndent(StringBuilder code, int indent = 0, char indendator = '\t', int indentIncrementor = 1)
 {
     private readonly char _indendator = indendator;
@@ -1915,3 +1002,4 @@ internal struct AutoIndent(StringBuilder code, int indent = 0, char indendator =
         return this;
     }
 }
+#endif

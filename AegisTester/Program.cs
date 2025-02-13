@@ -196,7 +196,7 @@ public class Benchy
     public void Aegis_V3()
     {
         var dr = _dt.CreateDataReader();
-        var list = TestClassAegisAgent.ReadList3(dr);
+        var list = TestClassAegisAgent.ReadList(dr);
     }
 
     static DataTable _dt;
@@ -1615,7 +1615,7 @@ public class Bench
         //var list = PersonAegisAgent.ReadList(dr);
         //var list = PersonAegisAgent.Read(dr).ToList();
         //var list = PersonAegisAgent.ReadList2(dr);
-        var list = PersonAegisAgent.ReadList3(dr);
+        var list = PersonAegisAgent.ReadList(dr);
 
         return list;
     }
