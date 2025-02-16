@@ -2,17 +2,19 @@
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using System;
+using System.CodeDom.Compiler;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
-using System.Xml.Linq;
 
 namespace Aegis;
 
@@ -86,6 +88,7 @@ internal sealed class AegisGen : IIncrementalGenerator
             return;
 
         var sourceCode = new StringBuilder();
+
         foreach (var (type, parser) in types)
         {
             if (token.IsCancellationRequested) return;
@@ -98,6 +101,8 @@ internal sealed class AegisGen : IIncrementalGenerator
                 continue;
             }
 
+            int indentLevel = 0;
+
             sourceCode
                 .Append("using System;\n")
                 .Append("using System.Data;\n")
@@ -108,27 +113,28 @@ internal sealed class AegisGen : IIncrementalGenerator
                 .Append('\n');
             
             var typeNamespace = type.ContainingNamespace is { IsGlobalNamespace: false } ? type.ContainingNamespace : null;
-            var namespaceAdded = false;
 
             if (typeNamespace != null)
             {
                 var namespaceString = typeNamespace.ToDisplayString();
-                sourceCode.AppendFormat("namespace {0}\n", namespaceString);
 
-                namespaceAdded = true;
+                sourceCode.AppendIndented(indentLevel,
+                    $$"""
+                    namespace {{namespaceString}}
+                    {
+                    """);
+
+                indentLevel += 1;
             }
 
-            if (namespaceAdded)
-            {
-                sourceCode.Append('{');
-            }
-
-            sourceCode.AppendFormat(@"
-    public sealed partial class {0}AegisAgent
-    {{", type.Name);
+            sourceCode.AppendIndented(indentLevel, 
+                $$"""
+                public sealed partial class {{type.Name}}AegisAgent
+                {
+                """);
 
             IEnumerable<Action> methods = [
-                () => AppendReadList(sourceCode, type, token),
+                () => AppendReadList(sourceCode, type, indentLevel + 1, token),
                 () => AppendReadSchemaIndexes(sourceCode, type, token),
                 () => AppendReadSchemaColumnIndex(sourceCode, type, matchCase, token),
             ];
@@ -144,11 +150,15 @@ internal sealed class AegisGen : IIncrementalGenerator
                 method();
             }
 
-            sourceCode.Append(@"
-    }");
+            sourceCode.AppendIndented(indentLevel,
+                $$"""
+                }
+                """);
 
-            if (namespaceAdded)
-                sourceCode.Append("\n}");
+            if(typeNamespace != null)
+            {
+                sourceCode.AppendLine().Append('}');
+            }
 
             if (token.IsCancellationRequested) return;
 
@@ -163,66 +173,34 @@ internal sealed class AegisGen : IIncrementalGenerator
         }
     }
 
-    internal static void AppendReadList(StringBuilder sourceCode, ITypeSymbol type, CancellationToken token = default)
+    internal static IndentInterpolatedStringHandler AppendReadList(StringBuilder sourceCode, ITypeSymbol type, int indent = 0, CancellationToken token = default)
     {
-        sourceCode.AppendFormat(@"
-        internal static List<{0}> ReadList<TReader>(TReader reader)
-            where TReader : IDataReader
-        {{
-            var result = new List<{0}>();
+        var properties = type.GetSettableProperties().ToArray();
 
-            ReadSchemaIndexes(reader", type.Name);
+        return sourceCode.AppendIndented(indent,
+            $$"""
 
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            sourceCode.AppendFormat(", out var col{0}", property.Name);
-        }
-
-        sourceCode.Append(");\n");
-
-        sourceCode.AppendFormat(@"
-            while(reader.Read())
-            {{
-                var parsed = new {0}();", type.Name);
-
-        sourceCode.Append('\n');
-
-        foreach (var member in type.GetMembers())
-        {
-            if (token.IsCancellationRequested) return;
-
-            if (!TryGetSettableProperty(member, out var property))
-                continue;
-
-            var propertyType = property.Type.ToDisplayString();
-
-            if (property.Type.IsReferenceType)
+            internal static List<{{type.Name}}> ReadList<TReader>(TReader reader)
+                where TReader : IDataReader
             {
-                sourceCode.AppendFormat(@"
-                if(col{0} != -1) parsed.{0} = reader[col{0}] as {1};", property.Name, propertyType);
-            }
-            else
-            {
-                sourceCode.AppendFormat(@"
-                if(col{0} != -1 && reader[col{0}] is {1} p{0}) parsed.{0} = p{0};", property.Name, propertyType);
-            }
-        }
-
-        sourceCode.Append('\n');
-
-        sourceCode.Append(@"
-
-                result.Add(parsed);
-            }
+                var result = new List<{{type.Name}}>();
             
-            return result;
-        }");
+                ReadSchemaIndexes(reader{{properties.Select(x => $", out var col{x.Name}")}});
+
+                while(reader.Read())
+                {
+                    var parsed = new {{type.Name}}();
+
+                    {{properties.ToSyntax(x => x.Type.IsReferenceType
+                        ? $"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.ToDisplayString()};\n"
+                        : $"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.ToDisplayString()} p{x.Name}) parsed.{x.Name} = p{x.Name};\n")}}
+                    result.Add(parsed);
+                }
+
+                return result;
+            }
+            """
+        );
     }
 
     internal static void AppendReadSchemaIndexes(StringBuilder sourceCode, ITypeSymbol type, CancellationToken token = default)
@@ -286,6 +264,125 @@ internal sealed class AegisGen : IIncrementalGenerator
     }
 
     internal static void AppendReadSchemaColumnIndex(StringBuilder sourceCode, ITypeSymbol type, int matchCases, CancellationToken token = default)
+    {
+        if (token.IsCancellationRequested) return;
+
+        var properties = type.GetSettableProperties().ToArray();
+
+        var namesToMatch = new SortedDictionary<int, List<(string name, IPropertySymbol property)>>();
+        var names = new List<string>();
+
+        foreach (var property in properties)
+        {
+            if (token.IsCancellationRequested) return;
+
+            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase))
+            {
+                var lowerCase =
+                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.MatchOriginal) ||
+                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Camel) ||
+                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Pascal)
+                    ? property.Name.ToLower()
+                    : null;
+
+                if (lowerCase != null)
+                {
+                    if (!namesToMatch.TryGetValue(lowerCase.Length, out var sameLength))
+                    {
+                        namesToMatch[lowerCase.Length] = sameLength = [];
+                    }
+
+                    sameLength.Add((lowerCase, property));
+                }
+
+                var snake = MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Snake)
+                    ? MatchCaseGenerator.ToSnakeCase(property.Name)
+                    : null;
+
+                if (snake != null && snake != lowerCase)
+                {
+                    if (!namesToMatch.TryGetValue(snake.Length, out var sameLength))
+                    {
+                        namesToMatch[snake.Length] = sameLength = [];
+                    }
+
+                    sameLength.Add((snake, property));
+                }
+
+                continue;
+            }
+
+            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.MatchOriginal))
+            {
+                var original = property.Name;
+                names.Add(original);
+            }
+
+            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Snake))
+            {
+                var snake = MatchCaseGenerator.ToSnakeCase(property.Name);
+                if (!names.Contains(snake)) names.Add(snake);
+            }
+
+            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Camel))
+            {
+                var camel = MatchCaseGenerator.ToCamelCase(property.Name);
+                if (!names.Contains(camel)) names.Add(camel);
+            }
+
+            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Pascal))
+            {
+                var pascal = MatchCaseGenerator.ToPascalCase(property.Name);
+                if (!names.Contains(pascal)) names.Add(pascal);
+            }
+
+            foreach (var nameCase in names)
+            {
+                if (!namesToMatch.TryGetValue(nameCase.Length, out var sameLength))
+                {
+                    namesToMatch[nameCase.Length] = sameLength = [];
+                }
+
+                sameLength.Add((nameCase, property));
+            }
+
+            names.Clear();
+        }
+
+        foreach (var sameLengthNames in namesToMatch)
+        {
+            sameLengthNames.Value.Sort((x, y) => StringComparer.OrdinalIgnoreCase.Compare(x.name, y.name));
+        }
+
+        sourceCode.AppendIndented(2,
+            $$"""
+
+            internal static void ReadSchemaColumnIndex(string c, int i{{properties.Select(x => $", ref int col{x.Name}")}})
+            {
+                switch(c.Length)
+                {
+                    {{namesToMatch.ToSyntax(n =>$$"""
+                    case {{n.Key}}:
+                        {{n.Value.ToSyntax(x => $$"""
+                            {{(MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase)
+                        ? $"if(col{x.property.Name} == -1 && string.Equals(c, \"{x.name}\", StringComparison.OrdinalIgnoreCase)"
+                        : $"if(col{x.property.Name} == -1 && c == \"{x.name}\")")}}
+                            {
+                                col{{x.property.Name}} = i;
+                                return;
+                            }
+                            """)
+                        }}
+                        break;
+
+                    """)}}
+                }
+            }
+            """);
+    }
+
+
+    internal static void AppendReadSchemaColumnIndex2(StringBuilder sourceCode, ITypeSymbol type, int matchCases, CancellationToken token = default)
     {
         if (token.IsCancellationRequested) return;
 
@@ -697,6 +794,33 @@ internal readonly struct SettableProperties(ImmutableArray<ISymbol> properties, 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Enumerator GetEnumerator() => new(_properties, _token);
 
+    public int Count()
+    {
+        var count = 0;
+
+        for (int i = 0; i != _properties.Length && !_token.IsCancellationRequested; i++)
+            count += _properties[i].IsSettableProperty(out _) ? 1 : 0;
+
+        return count;
+    }
+
+    public IPropertySymbol[] ToArray()
+    {
+        var count = Count();
+
+        var properties = new IPropertySymbol[count];
+
+        var writeIndex = -1;
+        
+        for(int i = 0; i != _properties.Length && !_token.IsCancellationRequested; i++)
+        {
+            if (_properties[i].IsSettableProperty(out var settableProperty))
+                properties[++writeIndex] = settableProperty;
+        }
+
+        return properties;
+    }
+
     public struct Enumerator(ImmutableArray<ISymbol> source, CancellationToken token)
     {
         private int _index = -1;
@@ -734,6 +858,9 @@ internal readonly struct SettableProperties(ImmutableArray<ISymbol> properties, 
 
 internal static class SymbolExtensions
 {
+    public static SettableProperties GetSettableProperties(this ITypeSymbol type, CancellationToken token = default)
+        => new(type.GetMembers(), token);
+
     public static SettableProperties GetSettableProperties(this INamedTypeSymbol type, CancellationToken token = default)
         => new(type.GetMembers(), token);
 
@@ -749,257 +876,338 @@ internal static class SymbolExtensions
     }
 }
 
-#if false
-internal struct AutoIndent(StringBuilder code, int indent = 0, char indendator = '\t', int indentIncrementor = 1)
+public static class StringBuilderExtensions
 {
-    private readonly char _indendator = indendator;
-    private readonly int _indentIncrementor = indentIncrementor;
-
-    private readonly StringBuilder _code = code;
-    private int _indent = indent;
-
-    public readonly char Indendator => _indendator;
-    public readonly int IndentIncrementor => _indentIncrementor;
-
-    public readonly AutoIndent AppendIndented(char value, int repeatCount)
-        => WriteIndent().Append(value, repeatCount);
-
-    public readonly AutoIndent AppendIndented(bool value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(char value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(ulong value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(uint value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(byte value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(string value, int startIndex, int count)
-        => WriteIndent().Append(value, startIndex, count);
-
-    public readonly AutoIndent AppendIndented(string value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(float value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(ushort value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(object value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(char[] value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(char[] value, int startIndex, int charCount)
-        => WriteIndent().Append(value, startIndex, charCount);
-
-    public readonly AutoIndent AppendIndented(sbyte value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(decimal value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(short value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(int value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(long value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendIndented(double value)
-        => WriteIndent().Append(value);
-
-    public readonly AutoIndent AppendFormatIndented(string format, object arg0)
-        => WriteIndent().AppendFormat(format, arg0);
-
-    public readonly AutoIndent AppendFormatIndented(string format, object arg0, object arg1)
-        => WriteIndent().AppendFormat(format, arg0, arg1);
-
-    public readonly AutoIndent AppendFormatIndented(string format, object arg0, object arg1, object arg2)
-        => WriteIndent().AppendFormat(format, arg0, arg1, arg2);
-
-    public readonly AutoIndent AppendFormatIndented(string format, params object[] args)
-        => WriteIndent().AppendFormat(format, args);
-
-
-    public readonly AutoIndent Append(char value, int repeatCount)
+    public static IndentInterpolatedStringHandler AppendIndented(
+        this StringBuilder sourceCode,
+        int indent,
+        [InterpolatedStringHandlerArgument(nameof(indent), nameof(sourceCode))]
+        IndentInterpolatedStringHandler handler
+    )
     {
-        _code.Append(value, repeatCount);
-        return this;
+        return handler;
     }
 
-    public readonly AutoIndent Append(bool value)
+    public static IndentInterpolatedStringHandler AppendIndented(
+        this StringBuilder sourceCode,
+        int indent,
+        CancellationToken token,
+        [InterpolatedStringHandlerArgument(nameof(indent), nameof(sourceCode), nameof(token))]
+        IndentInterpolatedStringHandler handler
+    )
     {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(char value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(ulong value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(uint value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(byte value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(string value, int startIndex, int count)
-    {
-        _code.Append(value, startIndex, count);
-        return this;
-    }
-
-    public readonly AutoIndent Append(string value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(float value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(ushort value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(object value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(char[] value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(char[] value, int startIndex, int charCount)
-    {
-        _code.Append(value, startIndex, charCount);
-        return this;
-    }
-
-    public readonly AutoIndent Append(sbyte value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(decimal value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(short value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(int value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(long value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent Append(double value)
-    {
-        _code.Append(value);
-        return this;
-    }
-
-    public readonly AutoIndent AppendFormat(string format, object arg0)
-    {
-        _code.AppendFormat(format, arg0);
-        return this;
-    }
-
-    public readonly AutoIndent AppendFormat(string format, object arg0, object arg1)
-    {
-        _code.AppendFormat(format, arg0, arg1);
-        return this;
-    }
-
-    public readonly AutoIndent AppendFormat(string format, object arg0, object arg1, object arg2)
-    {
-        _code.AppendFormat(format, arg0, arg1, arg2);
-        return this;
-    }
-
-    public readonly AutoIndent AppendFormat(string format, params object[] args)
-    {
-        _code.AppendFormat(format, args);
-        return this;
-    }
-
-    public readonly AutoIndent AppendLine()
-    {
-        _code.Append('\n');
-        return this;
-    }
-
-    public readonly AutoIndent AppendLine(string value)
-        => AppendLine().Append(value);
-
-    public readonly AutoIndent OpenCurlyBraces()
-        => AppendLine().AppendIndented('{').IncrementIntend();
-
-    public readonly AutoIndent CloseCurlyBraces()
-        => AppendLine().DecrementIntend().AppendIndented('}');
-
-    public readonly AutoIndent WriteIndent()
-    {
-        _code.Append(_indendator, _indent);
-        return this;
-    }
-
-    public AutoIndent DecrementIntend()
-    {
-        _indent += _indentIncrementor;
-        return this;
-    }
-
-    public AutoIndent IncrementIntend()
-    {
-        _indent += _indentIncrementor;
-        return this;
+        return handler;
     }
 }
+
+internal static class EnumerableExntensions
+{
+    internal static RepeatableSyntaxExpression<T> ToSyntax<T>(this IEnumerable<T> source, Func<T, string> expression)
+    {
+        return new RepeatableSyntaxExpression<T>(source, expression);
+    }
+}
+
+internal abstract class ExpressionResult
+{
+    public abstract void Write(IndentInterpolatedStringHandler sourceCode, ReadOnlySpan<char> whiteSpaceBefore, CancellationToken token);
+
+    public static implicit operator ExpressionResult(string simpleString) => new StringExressionResult(simpleString);
+}
+
+internal sealed class StringExressionResult(string _source) : ExpressionResult
+{
+    public override void Write(IndentInterpolatedStringHandler sourceCode, ReadOnlySpan<char> whiteSpaceBefore, CancellationToken token)
+    {
+        if (token.IsCancellationRequested) return;
+
+        sourceCode.AppendLiteral(whiteSpaceBefore);
+        sourceCode.AppendLiteral(_source);
+    }
+}
+
+[InterpolatedStringHandler]
+internal sealed class InterpolatedStringExpressionResult : ExpressionResult
+{
+    private readonly StringBuilder _tempStorage;
+
+    public InterpolatedStringExpressionResult(int literalLength, int formattedCount)
+    {
+        _tempStorage = new(literalLength);
+    }
+
+    public override void Write(IndentInterpolatedStringHandler sourceCode, ReadOnlySpan<char> whiteSpaceBefore, CancellationToken token)
+    {
+        var result = ToStringAndClear();
+
+    }
+
+    public unsafe void AppendLiteral(ReadOnlySpan<char> literal, CancellationToken token)
+    {
+        if (token.IsCancellationRequested)
+            return;
+
+        if (literal is not { Length: > 0 })
+            return;
+
+        bool end;
+
+        ReadOnlySpan<char> endsOfLine = stackalloc char[] { '\n', '\r' };
+
+        do
+        {
+
+#pragma warning disable CS9080 // Use of variable in this context may expose referenced variables outside of their declaration scope
+            end = !LineSplitter.FindNextLine(ref literal, out var part, endsOfLine);
+#pragma warning restore CS9080 // Use of variable in this context may expose referenced variables outside of their declaration scope
+
+#if DEBUG
+            var rem = literal.ToString();
+            var partStr = part.ToString();
 #endif
+
+            fixed (char* partPtr = part)
+            {
+                _sourceCode.Append(partPtr, part.Length);
+            }
+
+            _isLastAddedNewLine = part.Length > 0 &&
+                endsOfLine.Contains(
+                    part.Slice(part.Length - 1, 1), StringComparison.Ordinal
+                );
+
+#pragma warning disable CS9080
+            _lastWhiteSpace = part.IsWhiteSpace() ? part : [];
+#pragma warning restore CS9080
+
+        } while (!end && !_token.IsCancellationRequested);
+    }
+
+    public void AppendLiteral(string literal)
+        => _tempStorage.Append(literal);
+
+    public void AppendFormatted<T>(T value)
+    {
+        if(value != null)
+            AppendLiteral(value.ToString());
+    }
+
+    public void AppendFormatted<T>(T value, string format)
+        where T : IFormattable
+    {
+        _tempStorage.Append(value.ToString(format, null));
+    }
+
+    private string ToStringAndClear()
+    {
+        var result = _tempStorage.ToString();
+
+        _tempStorage.Clear();
+
+        return result;
+    }
+}
+
+internal sealed class RepeatableSyntaxExpression<T> : ISourceCodeWriter
+{
+    private readonly IEnumerable<T> _source;
+    private readonly Func<T, string> _expression;
+
+    public RepeatableSyntaxExpression(IEnumerable<T> source, Func<T, string> expression)
+    {
+        _source = source;
+        _expression = expression;
+    }
+
+    public void Accept(IndentInterpolatedStringHandler sourceCode, CancellationToken token)
+    {
+        if (token.IsCancellationRequested)
+            return;
+
+        using var enumerator = _source.GetEnumerator();
+
+        if(!enumerator.MoveNext()) return;
+
+        var indent = sourceCode.LastWhiteSpace;
+
+        var first = _expression(enumerator.Current);
+        sourceCode.AppendLiteral(first);
+
+        while (enumerator.MoveNext() && !token.IsCancellationRequested)
+        {
+            if(sourceCode.IsLastAddedNewLine)
+                sourceCode.AppendLiteral(indent);
+
+            var row = _expression(enumerator.Current);
+            sourceCode.AppendLiteral(row);
+        }
+    }
+
+    public override string ToString()
+    {
+        return string.Concat(_source.Select(_expression));
+    }
+}
+
+internal interface ISourceCodeWriter
+{
+    void Accept(IndentInterpolatedStringHandler sourceCode, CancellationToken token);
+}
+
+[InterpolatedStringHandler]
+public ref struct IndentInterpolatedStringHandler
+{
+    private readonly StringBuilder _sourceCode;
+    private readonly int _indent;
+    private readonly char _indentSymbol;
+    private readonly CancellationToken _token;
+
+    private bool _isFirstAppend = true;
+    private bool _isLastAddedNewLine = false;
+    private ReadOnlySpan<char> _lastWhiteSpace = [];
+
+    public IndentInterpolatedStringHandler(int literalLength, int formattedCount, int indent, StringBuilder sourceCode, CancellationToken token = default, char indentSymbol = '\t')
+    {
+        _sourceCode = sourceCode;
+        _sourceCode.EnsureCapacity(_sourceCode.Length + literalLength);
+
+        _token = token;
+        _indent = indent;
+        _indentSymbol = indentSymbol;
+    }
+
+    public readonly StringBuilder SourcCode => _sourceCode;
+    public readonly bool IsLastAddedNewLine => _isLastAddedNewLine;
+    public readonly ReadOnlySpan<char> LastWhiteSpace => _lastWhiteSpace;
+
+
+    public void AppendLiteral(string literal)
+        => AppendLiteral(literal.AsSpan());
+
+    public unsafe void AppendLiteral(ReadOnlySpan<char> literal)
+    {
+        if (_token.IsCancellationRequested)
+            return;
+
+        if (literal is not { Length: > 0 })
+            return;
+
+        bool end;
+
+        ReadOnlySpan<char> endsOfLine = stackalloc char[] { '\n', '\r' };
+
+        do
+        {
+
+#pragma warning disable CS9080 // Use of variable in this context may expose referenced variables outside of their declaration scope
+            end = !LineSplitter.FindNextLine(ref literal, out var part, endsOfLine);
+#pragma warning restore CS9080 // Use of variable in this context may expose referenced variables outside of their declaration scope
+
+#if DEBUG
+            var rem = literal.ToString();
+            var partStr = part.ToString();
+#endif
+
+            if(_isFirstAppend || _isLastAddedNewLine)
+            {
+                _isFirstAppend = false;
+                _isLastAddedNewLine = false;
+
+                AppendIndent();
+            }
+
+            fixed (char* partPtr = part)
+            {
+                _sourceCode.Append(partPtr, part.Length);
+            }
+
+            _isLastAddedNewLine = part.Length > 0 &&
+                endsOfLine.Contains(
+                    part.Slice(part.Length - 1, 1), StringComparison.Ordinal
+                );
+
+#pragma warning disable CS9080
+            _lastWhiteSpace = part.IsWhiteSpace() ? part : [];
+#pragma warning restore CS9080
+
+        } while (!end && !_token.IsCancellationRequested);
+    }
+
+    public void AppendFormatted<T>(T value)
+    {
+        if (_token.IsCancellationRequested)
+            return;
+
+        // It has already added data to targeted StringBuilder
+        // just used for visualization
+        if (typeof(IndentInterpolatedStringHandler) == typeof(T))
+        {
+            return;
+        }
+
+        if(value is ISourceCodeWriter writer)
+        {
+            writer.Accept(this, _token);
+            return;
+        }
+
+        if(value is string str)
+        {
+            AppendLiteral(str);
+            return;
+        }
+
+        if (value is not IEnumerable<string> strings)
+        {
+            _sourceCode.Append(value);
+            return;
+        }
+
+        foreach(var item in strings)
+        {
+            if (_token.IsCancellationRequested)
+                return;
+
+            AppendLiteral(item);
+        }
+    }
+
+    public void AppendFormatted<T>(T value, string format)
+        where T : IFormattable
+    {
+        _sourceCode.Append(value.ToString(format, null));
+    }
+
+    public override string ToString()
+    {
+        return _sourceCode.ToString();
+    }
+
+    private void AppendNextLine()
+        => _sourceCode.AppendLine();
+
+    private void AppendIndent()
+        => _sourceCode.Append(_indentSymbol, _indent);
+}
+
+public static class LineSplitter
+{
+    public static bool FindNextLine(ref ReadOnlySpan<char> remaining, out ReadOnlySpan<char> part, ReadOnlySpan<char> endsOfLine)
+    {
+        part = remaining;
+
+        var endline = remaining.IndexOfAny(endsOfLine);
+
+        if (endline == -1 || endline == remaining.Length - 1)
+            return false;
+
+        // \r\n - single unit for eof
+        if (remaining[endline] == '\r' && remaining[endline + 1] == '\n')
+            endline += 1;
+
+        part = remaining.Slice(0, endline);
+        remaining = remaining.Slice(endline + 1);
+
+        return true;
+    }
+}
