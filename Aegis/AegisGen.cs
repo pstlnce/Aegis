@@ -5,6 +5,7 @@ using System;
 using System.CodeDom.Compiler;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Data;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
@@ -365,7 +366,7 @@ internal sealed class AegisGen : IIncrementalGenerator
                     case {{n.Key}}:
                         {{n.Value.ToSyntax(x => $$"""
                             {{(MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase)
-                        ? $"if(col{x.property.Name} == -1 && string.Equals(c, \"{x.name}\", StringComparison.OrdinalIgnoreCase)"
+                        ? $"if(col{x.property.Name} == -1 && string.Equals(c, \"{x.name}\", StringComparison.OrdinalIgnoreCase))"
                         : $"if(col{x.property.Name} == -1 && c == \"{x.name}\")")}}
                             {
                                 col{{x.property.Name}} = i;
@@ -878,6 +879,14 @@ internal static class SymbolExtensions
 
 public static class StringBuilderExtensions
 {
+    public static unsafe void Append(this StringBuilder builder, ReadOnlySpan<char> span)
+    {
+        fixed(char* ptr = span)
+        {
+            builder.Append(ptr, span.Length);
+        }
+    }
+
     public static IndentInterpolatedStringHandler AppendIndented(
         this StringBuilder sourceCode,
         int indent,
@@ -910,14 +919,14 @@ internal static class EnumerableExntensions
 
 internal abstract class ExpressionResult
 {
-    public abstract void Write(IndentInterpolatedStringHandler sourceCode, ReadOnlySpan<char> whiteSpaceBefore, CancellationToken token);
+    public abstract void Write(IndentInterpolatedStringHandler sourceCode, ReadOnlyMemory<char> whiteSpaceBefore, CancellationToken token);
 
     public static implicit operator ExpressionResult(string simpleString) => new StringExressionResult(simpleString);
 }
 
 internal sealed class StringExressionResult(string _source) : ExpressionResult
 {
-    public override void Write(IndentInterpolatedStringHandler sourceCode, ReadOnlySpan<char> whiteSpaceBefore, CancellationToken token)
+    public override void Write(IndentInterpolatedStringHandler sourceCode, ReadOnlyMemory<char> whiteSpaceBefore, CancellationToken token)
     {
         if (token.IsCancellationRequested) return;
 
@@ -936,51 +945,10 @@ internal sealed class InterpolatedStringExpressionResult : ExpressionResult
         _tempStorage = new(literalLength);
     }
 
-    public override void Write(IndentInterpolatedStringHandler sourceCode, ReadOnlySpan<char> whiteSpaceBefore, CancellationToken token)
+    public override void Write(IndentInterpolatedStringHandler sourceCode, ReadOnlyMemory <char> whiteSpaceBefore, CancellationToken token)
     {
         var result = ToStringAndClear();
 
-    }
-
-    public unsafe void AppendLiteral(ReadOnlySpan<char> literal, CancellationToken token)
-    {
-        if (token.IsCancellationRequested)
-            return;
-
-        if (literal is not { Length: > 0 })
-            return;
-
-        bool end;
-
-        ReadOnlySpan<char> endsOfLine = stackalloc char[] { '\n', '\r' };
-
-        do
-        {
-
-#pragma warning disable CS9080 // Use of variable in this context may expose referenced variables outside of their declaration scope
-            end = !LineSplitter.FindNextLine(ref literal, out var part, endsOfLine);
-#pragma warning restore CS9080 // Use of variable in this context may expose referenced variables outside of their declaration scope
-
-#if DEBUG
-            var rem = literal.ToString();
-            var partStr = part.ToString();
-#endif
-
-            fixed (char* partPtr = part)
-            {
-                _sourceCode.Append(partPtr, part.Length);
-            }
-
-            _isLastAddedNewLine = part.Length > 0 &&
-                endsOfLine.Contains(
-                    part.Slice(part.Length - 1, 1), StringComparison.Ordinal
-                );
-
-#pragma warning disable CS9080
-            _lastWhiteSpace = part.IsWhiteSpace() ? part : [];
-#pragma warning restore CS9080
-
-        } while (!end && !_token.IsCancellationRequested);
     }
 
     public void AppendLiteral(string literal)
@@ -1064,7 +1032,7 @@ public ref struct IndentInterpolatedStringHandler
 
     private bool _isFirstAppend = true;
     private bool _isLastAddedNewLine = false;
-    private ReadOnlySpan<char> _lastWhiteSpace = [];
+    private ReadOnlyMemory<char> _lastWhiteSpace;
 
     public IndentInterpolatedStringHandler(int literalLength, int formattedCount, int indent, StringBuilder sourceCode, CancellationToken token = default, char indentSymbol = '\t')
     {
@@ -1078,13 +1046,13 @@ public ref struct IndentInterpolatedStringHandler
 
     public readonly StringBuilder SourcCode => _sourceCode;
     public readonly bool IsLastAddedNewLine => _isLastAddedNewLine;
-    public readonly ReadOnlySpan<char> LastWhiteSpace => _lastWhiteSpace;
+    public readonly ReadOnlyMemory<char> LastWhiteSpace => _lastWhiteSpace;
 
 
     public void AppendLiteral(string literal)
-        => AppendLiteral(literal.AsSpan());
+        => AppendLiteral(literal.AsMemory());
 
-    public unsafe void AppendLiteral(ReadOnlySpan<char> literal)
+    public void AppendLiteral(ReadOnlyMemory<char> literal)
     {
         if (_token.IsCancellationRequested)
             return;
@@ -1094,13 +1062,10 @@ public ref struct IndentInterpolatedStringHandler
 
         bool end;
 
-        ReadOnlySpan<char> endsOfLine = stackalloc char[] { '\n', '\r' };
-
         do
         {
-
 #pragma warning disable CS9080 // Use of variable in this context may expose referenced variables outside of their declaration scope
-            end = !LineSplitter.FindNextLine(ref literal, out var part, endsOfLine);
+            end = !LineSplitter.FindNextLine(ref literal, out var part);
 #pragma warning restore CS9080 // Use of variable in this context may expose referenced variables outside of their declaration scope
 
 #if DEBUG
@@ -1116,18 +1081,14 @@ public ref struct IndentInterpolatedStringHandler
                 AppendIndent();
             }
 
-            fixed (char* partPtr = part)
-            {
-                _sourceCode.Append(partPtr, part.Length);
-            }
+            _sourceCode.Append(part);
 
             _isLastAddedNewLine = part.Length > 0 &&
-                endsOfLine.Contains(
-                    part.Slice(part.Length - 1, 1), StringComparison.Ordinal
-                );
+                part.Span.Slice(part.Length - 1, 1) is { Length: 1 } partEnd &&
+                partEnd[0] is '\r' or '\n';
 
 #pragma warning disable CS9080
-            _lastWhiteSpace = part.IsWhiteSpace() ? part : [];
+            _lastWhiteSpace = part.Span.IsWhiteSpace() ? part : default;
 #pragma warning restore CS9080
 
         } while (!end && !_token.IsCancellationRequested);
@@ -1183,20 +1144,222 @@ public ref struct IndentInterpolatedStringHandler
         return _sourceCode.ToString();
     }
 
-    private void AppendNextLine()
-        => _sourceCode.AppendLine();
-
     private void AppendIndent()
         => _sourceCode.Append(_indentSymbol, _indent);
 }
 
+internal ref struct IndentStackWriter
+{
+    private readonly StringBuilder _sourceCode;
+
+    private Memory<char> _indent;
+    private Memory<int> _indentSlices;
+    private int _slicesCount = 0;
+    private int _sliceEnd = 0;
+
+    private ArraySegment<char> _lastLine;
+
+    public IndentStackWriter(StringBuilder sourceCode, int indentInitial = 0, char indentSymbol = '\t')
+    {
+        _sourceCode = sourceCode;
+        AddIndent(indentInitial, indentSymbol);
+    }
+
+    public IndentStackWriter(StringBuilder sourceCode, ReadOnlySpan<char> initialIndent)
+    {
+        _sourceCode = sourceCode;
+        AddIndent(initialIndent);
+    }
+
+    public readonly ReadOnlyMemory<char> Indent => _indent.Slice(0, _sliceEnd);
+
+    public readonly ReadOnlyMemory<char> LastLine => _lastLine.AsMemory();
+
+    public readonly void AppendLineSplitted(ReadOnlySpan<char> source)
+    {
+        if (source.IsEmpty) return;
+
+        bool end;
+        ReadOnlySpan<char> last = default;
+        ReadOnlySpan<char> line = default;
+
+        do
+        {
+            end = !LineSplitter.FindNextLine(ref source, ref line);
+            if (line.IsEmpty) continue;
+
+            AppendIndent();
+            _sourceCode.Append(line);
+            last = line;
+
+        } while (!end);
+
+#pragma warning disable CS8656 // For using this method after stackalloc 
+        WriteLastLine(last);
+#pragma warning restore CS8656
+    }
+
+    public readonly void Append(ReadOnlySpan<char> source)
+    {
+        if (source.IsEmpty) return;
+
+        AppendIndent();
+        _sourceCode.Append(source);
+    }
+
+    public void AddIndent(int times, char symbol)
+    {
+        if (times <= 0) return;
+
+        const int partSize = 8;
+
+        ReadOnlySpan<char> buffer = stackalloc char[partSize]
+        {
+            symbol, symbol,
+            symbol, symbol,
+            symbol, symbol,
+            symbol, symbol,
+        };
+
+        var remainder = times & (partSize - 1);
+        var part = remainder != 0 ? remainder : partSize;
+
+        do
+        {
+            times -= part;
+
+            EnsureBufferSizes(part);
+            CopyIndent(buffer.Slice(0, part));
+            IncrementStats(part);
+
+            part = partSize;
+
+        } while (times != 0);
+    }
+
+    public void AddIndent(ReadOnlySpan<char> indent)
+    {
+        if (indent.IsEmpty) return;
+
+        EnsureBufferSizes(indent.Length);
+        CopyIndent(indent);
+        IncrementStats(indent.Length);
+    }
+
+    private readonly void AppendIndent()
+    {
+        _sourceCode.Append(_indent.Span.Slice(0, _sliceEnd));
+    }
+
+    private readonly void CopyIndent(ReadOnlySpan<char> indent)
+    {
+        var targetSlice = _indent.Span.Slice(_sliceEnd, indent.Length);
+        indent.CopyTo(targetSlice);
+    }
+
+    private void IncrementStats(int indentLength)
+    {
+        _indentSlices.Span[_slicesCount] = indentLength;
+        _slicesCount += 1;
+        _sliceEnd += indentLength;
+    }
+
+    private void EnsureBufferSizes(int indentLength)
+        => EnsureBufferSizes(_indent.Length + indentLength, _slicesCount + 1);
+
+    private void EnsureBufferSizes(int length, int slicesLength)
+    {
+        EnsureIndentBufferSize(length);
+        EnsureSlicesBufferSize(slicesLength);
+    }
+
+    private void EnsureSlicesBufferSize(int length)
+    {
+        if (_indentSlices.Length >= length)
+            return;
+
+        var newSize = CalculateNewSize(_indentSlices.Length, length);
+
+        Memory<int> newBuffer = new int[newSize];
+        _indentSlices.CopyTo(newBuffer);
+
+        _indentSlices = newBuffer;
+    }
+
+    private void EnsureIndentBufferSize(int length)
+    {
+        if (_indent.Length >= length)
+            return;
+
+        var newSize = CalculateNewSize(_indent.Length, length);
+
+        Memory<char> newBuffer = new char[newSize];
+        _indent.CopyTo(newBuffer);
+
+        _indent = newBuffer;
+    }
+
+    private void WriteLastLine(ReadOnlySpan<char> line)
+    {
+        EnsureLastLineSize(line.Length);
+
+        var lastLineBuffer = _lastLine.Array;
+        line.CopyTo(lastLineBuffer);
+
+        SetLastLineCount(line.Length);
+    }
+
+    private void SetLastLineCount(int count)
+    {
+        _lastLine = new(_lastLine.Array, 0, count);
+    }
+
+    private void EnsureLastLineSize(int length)
+    {
+        if (_lastLine.Array.Length >= length)
+            return;
+
+        var newSize = CalculateNewSize(_lastLine.Array.Length, length);
+        var newBuffer = new char[newSize];
+        _lastLine = new ArraySegment<char>(newBuffer);
+    }
+
+    private static int CalculateNewSize(int current, int atLeast)
+    {
+        current = current <= 0 ? 4 : current;
+
+        var newSize = (current * 3) >> 1;
+        return Math.Max(newSize, atLeast);
+    }
+}
+
 public static class LineSplitter
 {
-    public static bool FindNextLine(ref ReadOnlySpan<char> remaining, out ReadOnlySpan<char> part, ReadOnlySpan<char> endsOfLine)
+    public static bool FindNextLine(ref ReadOnlyMemory<char> remainingMemory, out ReadOnlyMemory<char> part)
+    {
+        var remaining = remainingMemory.Span;
+        part = remainingMemory;
+
+        var endline = remaining.IndexOfAny('\r', '\n');
+
+        if (endline == -1 || endline == remaining.Length - 1)
+            return false;
+
+        // \r\n - single unit for eof
+        if (remaining[endline] == '\r' && remaining[endline + 1] == '\n')
+            endline += 1;
+
+        part = remainingMemory.Slice(0, endline);
+        remainingMemory = remainingMemory.Slice(endline + 1);
+
+        return true;
+    }
+
+    public static bool FindNextLine(ref ReadOnlySpan<char> remaining, ref ReadOnlySpan<char> part)
     {
         part = remaining;
 
-        var endline = remaining.IndexOfAny(endsOfLine);
+        var endline = remaining.IndexOfAny('\r', '\n');
 
         if (endline == -1 || endline == remaining.Length - 1)
             return false;
