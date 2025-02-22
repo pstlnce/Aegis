@@ -1,4 +1,5 @@
-﻿using Microsoft.CodeAnalysis;
+﻿using Aegis.IndentWriter;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using System;
@@ -98,12 +99,11 @@ internal sealed class AegisGen : IIncrementalGenerator
                 continue;
             }
 
-            var writer = new IndentStackWriter(sourceCode);
+            var _ = new IndentStackWriter(sourceCode);
             
             var typeNamespace = type.ContainingNamespace is { IsGlobalNamespace: false } ? type.ContainingNamespace : null;
 
-            writer.AppendIndented(
-                $$"""
+            var ignore = _[$$"""
                 using System;
                 using System.Data;
                 using System.Data.Common;
@@ -111,16 +111,19 @@ internal sealed class AegisGen : IIncrementalGenerator
                 using System.Collections.ObjectModel;
                 using System.Runtime.CompilerServices;
 
-                {{writer.ToSyntax([typeNamespace], (_, x) => x == null
-                ? _[AppendClass(_, type, matchCase, token)]
-                : _[$$"""
-                namespace {{x}}
-                {
-                    {{_[AppendClass(_, type, matchCase, token)]}}
-                }
-                """])
-                }}
-                """);
+                {{_[
+                    typeNamespace == null
+                    ? AppendClass(_, type, matchCase, token)
+                    : _[$$""" 
+                        namespace {{typeNamespace}}
+                        {
+                            {{_.Scope[AppendClass(_, type, matchCase, token)]}}
+                        }
+                        """
+                    ]
+                ]}}
+                """
+            ];
 
             if (token.IsCancellationRequested) return;
 
@@ -135,16 +138,16 @@ internal sealed class AegisGen : IIncrementalGenerator
         }
     }
 
-    internal static IndentedInterpolatedStringHandler AppendClass(IndentStackWriter writer, ITypeSymbol type, int matchCases, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendClass(IndentStackWriter _, ITypeSymbol type, int matchCases, CancellationToken token = default)
     {
-        return writer[$$"""
+        return _[$$"""
             public sealed partial class {{type.Name}}AegisAgent
             {
-                {{writer.ToSyntax([type], (w, t) => w[AppendReadList(writer, type)])}}
+                {{_.Scope[AppendReadList(_, type)]}}
 
-                {{writer.ToSyntax([type], (w, t) => w[AppendReadSchemaIndexes(writer, type)])}}
+                {{_.Scope[AppendReadSchemaIndexes(_, type)]}}
 
-                {{writer.ToSyntax([type], (w, t) => w[AppendReadSchemaColumnIndex(writer, type, matchCases)])}}
+                {{_.Scope[AppendReadSchemaColumnIndex(_, type, matchCases)]}}
             }
             """];
     }
@@ -166,7 +169,7 @@ internal sealed class AegisGen : IIncrementalGenerator
                 {
                     var parsed = new {{type.Name}}();
             
-                    {{writer.ToSyntax(properties, (w, x) => x.Type.IsReferenceType
+                    {{writer.Scope.ForEach(properties, (w, x) => x.Type.IsReferenceType
                         ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.ToDisplayString()};"]
                         : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.ToDisplayString()} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
                         joinBy: "\n")}}
@@ -188,7 +191,7 @@ internal sealed class AegisGen : IIncrementalGenerator
             internal static void ReadSchemaIndexes<TReader>(TReader reader{{properties.Select(x => $", out int column{x.Name}")}})
                 where TReader : IDataReader
             {
-                {{writer.ToSyntax(properties, (w,x) => w[$"column{x.Name} = -1;"], joinBy: "\n")}}
+                {{writer.Scope[properties.Select(x => $"column{x.Name} = -1;"), joinBy: "\n"]}}
 
                 for(int i = 0; i != reader.FieldCount; i++)
                 {
@@ -295,9 +298,9 @@ internal sealed class AegisGen : IIncrementalGenerator
             {
                 switch(c.Length)
                 {
-                    {{writer.ToSyntax(namesToMatch, (_, n) => _[$$"""
+                    {{writer.Scope.ForEach(namesToMatch, (_, n) => _[$$"""
                     case {{n.Key}}:
-                        {{writer.ToSyntax(n.Value, (_, x) => _[$$"""
+                        {{writer.Scope.ForEach(n.Value, (_, x) => _[$$"""
                             {{(MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase)
                         ? $"if(col{x.property.Name} == -1 && string.Equals(c, \"{x.name}\", StringComparison.OrdinalIgnoreCase))"
                         : $"if(col{x.property.Name} == -1 && c == \"{x.name}\")")}}
@@ -632,572 +635,5 @@ internal static class SymbolExtensions
         };
 
         return result;
-    }
-}
-
-internal static class StringBuilderExtensions
-{
-    public static unsafe void Append(this StringBuilder builder, ReadOnlySpan<char> span)
-    {
-        fixed(char* ptr = span)
-        {
-            builder.Append(ptr, span.Length);
-        }
-    }
-
-    public static string AppendIndented(
-        this IndentStackWriter sourceCode,
-        [InterpolatedStringHandlerArgument(nameof(sourceCode))]
-        IndentedInterpolatedStringHandler handler
-    )
-    {
-        return handler.ToString();
-    }
-}
-
-internal static class EnumerableExntensions
-{
-    internal static SingleSyntax<T> ToSyntax<T>(
-        this IndentStackWriter writer,
-        T source,
-        Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> cast
-        )
-    {
-        return new(writer, source, cast);
-    }
-
-    internal static SingleStringSyntax<T> ToSyntax<T>(
-        this IndentStackWriter writer,
-        T source,
-        Func<IndentStackWriter, T, string> cast
-        )
-    {
-        return new(writer, source, cast);
-    }
-
-    internal static RepeatableSyntax<T> ToSyntax<T>(
-        this IndentStackWriter writer,
-        IEnumerable<T> source,
-        Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> cast,
-        string joinBy = "\n\n"
-        )
-    {
-        return new(writer, source, cast, joinBy.AsMemory());
-    }
-
-    internal static RepeatableStringsSyntax<T> ToSyntax<T>(
-        this IndentStackWriter writer,
-        IEnumerable<T> source,
-        Func<IndentStackWriter, T, string> cast,
-        string joinBy = "\n\n"
-        )
-    {
-        return new(writer, source, cast, joinBy.AsMemory());
-    }
-}
-
-internal readonly struct SingleSyntax<T>(IndentStackWriter writer, T source, Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> write)
-{
-    private readonly IndentStackWriter _writer = writer;
-    private readonly T _source = source;
-    private readonly Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> _write = write;
-
-    [DebuggerHidden]
-    public readonly override string ToString()
-    {
-        var lastLine = _writer.LastLine.Span;
-
-        bool addedIndent;
-        if (addedIndent = !lastLine.IsEmpty && !lastLine.IsAddedNewLine() && lastLine.IsWhiteSpace())
-        {
-            _writer.AddIndent(lastLine);
-        }
-
-        _write(_writer, _source);
-
-        if (addedIndent)
-        {
-            _writer.PopIndent();
-        }
-
-        return string.Empty;
-    }
-}
-
-internal readonly struct SingleStringSyntax<T>(IndentStackWriter writer, T source, Func<IndentStackWriter, T, string> cast)
-{
-    private readonly IndentStackWriter _writer = writer;
-    private readonly T _source = source;
-    private readonly Func<IndentStackWriter, T, string> _cast = cast;
-
-    [DebuggerHidden]
-    public readonly override string ToString()
-    {
-        var lastLine = _writer.LastLine.Span;
-
-        if (_source is null) return string.Empty;
-
-        bool addedIndent;
-        if (addedIndent = !lastLine.IsEmpty && !lastLine.IsAddedNewLine() && lastLine.IsWhiteSpace())
-        {
-            _writer.AddIndent(lastLine);
-        }
-        
-        var stringValue = _cast(_writer, _source);
-
-        _writer.AppendLineSplitted(stringValue.AsSpan());
-
-        if (addedIndent)
-        {
-            _writer.PopIndent();
-        }
-
-        return string.Empty;
-    }
-}
-
-internal readonly struct RepeatableSyntax<T>(IndentStackWriter writer, IEnumerable<T> source, Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> write, ReadOnlyMemory<char> joinBy = default)
-{
-    private readonly IndentStackWriter _writer = writer;
-    private readonly IEnumerable<T> _source = source;
-    private readonly Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> _write = write;
-    private readonly ReadOnlyMemory<char> _joinBy = joinBy;
-
-    [DebuggerHidden]
-    public readonly override string ToString()
-    {
-        var lastLine = _writer.LastLine.Span;
-
-        using var enumerator = _source.GetEnumerator();
-
-        if (!enumerator.MoveNext()) return string.Empty;
-
-        bool addedIndent;
-        if (addedIndent = !lastLine.IsEmpty && !lastLine.IsAddedNewLine() && lastLine.IsWhiteSpace())
-        {
-            _writer.AddIndent(lastLine);
-        }
-
-        bool end;
-        var previous = enumerator.Current;
-
-        do
-        {
-            _write(_writer, previous);
-
-            if (end = !enumerator.MoveNext()) continue;
-
-            _writer.AppendLineSplitted(_joinBy.Span);
-            
-            previous = enumerator.Current;
-
-        } while (!end);
-
-        if(addedIndent)
-        {
-            _writer.PopIndent();
-        }
-
-        return string.Empty;
-    }
-}
-
-internal readonly struct RepeatableStringsSyntax<T>(IndentStackWriter writer, IEnumerable<T> source, Func<IndentStackWriter, T, string> cast, ReadOnlyMemory<char> joinBy = default)
-{
-    private readonly IndentStackWriter _writer = writer;
-    private readonly IEnumerable<T> _source = source;
-    private readonly Func<IndentStackWriter, T, string> _cast = cast;
-    private readonly ReadOnlyMemory<char> _joinBy = joinBy;
-
-    [DebuggerHidden]
-    public readonly override string ToString()
-    {
-        var lastLine = _writer.LastLine.Span;
-
-        using var enumerator = _source.GetEnumerator();
-
-        if (!enumerator.MoveNext()) return string.Empty;
-
-        bool addedIndent;
-        if (addedIndent = !lastLine.IsEmpty && !lastLine.IsAddedNewLine() && lastLine.IsWhiteSpace())
-        {
-            _writer.AddIndent(lastLine);
-        }
-
-        bool end;
-        var previous = enumerator.Current;
-
-        do
-        {
-            var str = _cast(_writer, previous);
-            _writer.AppendLineSplitted(str.AsSpan());
-
-            if (end = !enumerator.MoveNext()) continue;
-
-            _writer.AppendLineSplitted(_joinBy.Span);
-
-            previous = enumerator.Current;
-
-        } while (!end);
-
-        if (addedIndent)
-        {
-            _writer.PopIndent();
-        }
-
-        return string.Empty;
-    }
-}
-
-[InterpolatedStringHandler]
-internal readonly struct IndentedInterpolatedStringHandler
-{
-    private readonly IndentStackWriter _writer;
-
-    public IndentedInterpolatedStringHandler(int literalLength, int formattedCount, IndentStackWriter writer)
-    {
-        _writer = writer;
-    }
-
-    public readonly void AppendLiteral(string literal)
-        => AppendLiteral(literal.AsSpan());
-
-    public readonly void AppendLiteral(ReadOnlySpan<char> literal)
-    {
-        _writer.AppendLineSplitted(literal);
-    }
-
-    public readonly void AppendFormatted<T>(T value)
-    {
-        // It has already added data to targeted StringBuilder
-        // just used for visualization
-        if (typeof(IndentedInterpolatedStringHandler) == typeof(T))
-        {
-            return;
-        }
-
-        if (value is string str)
-        {
-            AppendLiteral(str);
-            return;
-        }
-
-        if (value is not IEnumerable<string> strings)
-        {
-            if (value is not null)
-                AppendLiteral(value.ToString());
-
-            return;
-        }
-
-        foreach (var item in strings)
-        {
-            AppendLiteral(item);
-        }
-    }
-
-    public void AppendFormatted<T>(T value, string format)
-        where T : IFormattable
-    {
-        AppendLiteral(value.ToString(format, null));
-    }
-
-    public readonly override string ToString() => string.Empty;
-}
-
-internal class IndentStackWriter
-{
-    private readonly StringBuilder _sourceCode;
-
-    private Memory<char> _indent;
-    private Memory<int> _indentSlices;
-    private int _slicesCount = 0;
-    private int _sliceEnd = 0;
-
-    private ArraySegment<char> _lastLine = new([]);
-
-    public IndentStackWriter(StringBuilder sourceCode, int indentInitial = 0, char indentSymbol = '\t')
-    {
-        _sourceCode = sourceCode;
-        AddIndent(indentInitial, indentSymbol);
-    }
-
-    public IndentStackWriter(StringBuilder sourceCode, ReadOnlySpan<char> initialIndent)
-    {
-        _sourceCode = sourceCode;
-        AddIndent(initialIndent);
-    }
-
-    public ReadOnlyMemory<char> Indent => _indent.Slice(0, _sliceEnd);
-
-    public ReadOnlyMemory<char> LastLine => _lastLine.AsMemory();
-
-    public bool IsLastAddedLine => _lastLine.AsSpan().IsAddedNewLine();
-
-    public IndentedInterpolatedStringHandler Write([InterpolatedStringHandlerArgument("")] IndentedInterpolatedStringHandler handler)
-    {
-        return handler;
-    }
-
-    public IndentedInterpolatedStringHandler this[[InterpolatedStringHandlerArgument("")] IndentedInterpolatedStringHandler val] => val;
-
-    public string this[string simpleString] => new SingleSyntax<string>(this, simpleString, static (w, s) => w[$"{s}"]).ToString();
-
-    public string this[object source, Func<IndentStackWriter, object, IndentedInterpolatedStringHandler> cast, string joinBy = "\n\n"]
-        => new SingleSyntax<object>(this, source, cast).ToString();
-
-    public string this[IEnumerable<object> source, Func<IndentStackWriter, object, IndentedInterpolatedStringHandler> cast, string joinBy = "\n\n"]
-        => new RepeatableSyntax<object>(this, source, cast, joinBy.AsMemory()).ToString();
-
-    public void AppendLineSplitted(ReadOnlySpan<char> source)
-    {
-        if (source.IsEmpty) return;
-
-        bool end;
-        ReadOnlySpan<char> last = default;
-        ReadOnlySpan<char> line = default;
-
-        var lastAddedLine = IsLastAddedLine;
-        var noLineAdded = !lastAddedLine;
-
-        do
-        {
-            end = !LineSplitter.FindNextLine(ref source, ref line);
-            if (line.IsEmpty) continue;
-
-#if false && DEBUG
-            var rem = source.ToString();
-            var partStr = line.ToString();
-#endif
-            if(lastAddedLine)
-                AppendIndent();
-
-            lastAddedLine = true;
-
-            _sourceCode.Append(line);
-            last = line;
-
-            if(noLineAdded && line.IsAddedNewLine())
-            {
-                noLineAdded = false;
-            }
-
-        } while (!end);
-
-        if(false && noLineAdded)
-        {
-            AppendToLastLine(last);
-            return;
-        }
-
-        WriteLastLine(last);
-    }
-
-    public void Append(ReadOnlySpan<char> source)
-    {
-        if (source.IsEmpty) return;
-
-        AppendIndent();
-        _sourceCode.Append(source);
-    }
-
-    public void AddIndent(int times, char symbol)
-    {
-        if (times <= 0) return;
-
-        const int partSize = 4;
-
-        ReadOnlySpan<char> buffer = stackalloc char[partSize]
-        {
-            symbol, symbol,
-            symbol, symbol,
-        };
-
-        var remainder = times & (partSize - 1);
-        var part = remainder != 0 ? remainder : partSize;
-
-        do
-        {
-            times -= part;
-
-            EnsureBufferSizes(part);
-            CopyIndent(buffer.Slice(0, part));
-            IncrementStats(part);
-
-            part = partSize;
-
-        } while (times != 0);
-    }
-
-    public void PopIndent()
-    {
-        if(_slicesCount == 0) return;
-
-        _slicesCount -= 1;
-        _sliceEnd -= _indentSlices.Span[_slicesCount];
-    }
-    
-    public void AddIndent(ReadOnlySpan<char> indent)
-    {
-        if (indent.IsEmpty) return;
-
-        EnsureBufferSizes(indent.Length);
-        CopyIndent(indent);
-        IncrementStats(indent.Length);
-    }
-
-    private void AppendIndent()
-    {
-        _sourceCode.Append(_indent.Span.Slice(0, _sliceEnd));
-    }
-
-    private void CopyIndent(ReadOnlySpan<char> indent)
-    {
-        var targetSlice = _indent.Span.Slice(_sliceEnd, indent.Length);
-        indent.CopyTo(targetSlice);
-    }
-
-    private void IncrementStats(int indentLength)
-    {
-        _indentSlices.Span[_slicesCount] = indentLength;
-        _slicesCount += 1;
-        _sliceEnd += indentLength;
-    }
-
-    private void EnsureBufferSizes(int indentLength)
-        => EnsureBufferSizes(_indent.Length + indentLength, _slicesCount + 1);
-
-    private void EnsureBufferSizes(int length, int slicesLength)
-    {
-        EnsureIndentBufferSize(length);
-        EnsureSlicesBufferSize(slicesLength);
-    }
-
-    private void EnsureSlicesBufferSize(int length)
-    {
-        if (_indentSlices.Length >= length)
-            return;
-
-        var newSize = CalculateNewSize(_indentSlices.Length, length);
-
-        Memory<int> newBuffer = new int[newSize];
-        _indentSlices.CopyTo(newBuffer);
-
-        _indentSlices = newBuffer;
-    }
-
-    private void EnsureIndentBufferSize(int length)
-    {
-        if (_indent.Length >= length)
-            return;
-
-        var newSize = CalculateNewSize(_indent.Length, length);
-
-        Memory<char> newBuffer = new char[newSize];
-        _indent.CopyTo(newBuffer);
-
-        _indent = newBuffer;
-    }
-
-    private void AppendToLastLine(ReadOnlySpan<char> line)
-    {
-        var currentCount = _lastLine.Count;
-        EnsureLastLineSize(currentCount + line.Length, copy: true);
-
-        var lastLineBuffer = _lastLine.Array.AsSpan(currentCount);
-        line.CopyTo(lastLineBuffer);
-
-        SetLastLineCount(currentCount + line.Length);
-    }
-
-    private void WriteLastLine(ReadOnlySpan<char> line)
-    {
-        EnsureLastLineSize(line.Length, copy: false);
-
-        var lastLineBuffer = _lastLine.Array;
-        line.CopyTo(lastLineBuffer);
-
-        SetLastLineCount(line.Length);
-    }
-
-    private void SetLastLineCount(int count)
-    {
-        _lastLine = new(_lastLine.Array, 0, count);
-    }
-
-    private void EnsureLastLineSize(int length, bool copy)
-    {
-        if (_lastLine.Array.Length >= length)
-            return;
-
-        var newSize = CalculateNewSize(_lastLine.Array.Length, length);
-        var newBuffer = new char[newSize];
-
-        if(copy)
-        {
-            _lastLine.Array.CopyTo(newBuffer, 0);
-        }
-
-        _lastLine = new ArraySegment<char>(newBuffer);
-    }
-
-    private static int CalculateNewSize(int current, int atLeast)
-    {
-        current = current <= 0 ? 4 : current;
-
-        var newSize = (current * 3) >> 1;
-        return Math.Max(newSize, atLeast);
-    }
-}
-
-public static class LineSplitter
-{
-    public static bool FindNextLine(ref ReadOnlyMemory<char> remainingMemory, out ReadOnlyMemory<char> part)
-    {
-        var remaining = remainingMemory.Span;
-        part = remainingMemory;
-
-        var endline = remaining.IndexOfAny('\r', '\n');
-
-        if (endline == -1 || endline == remaining.Length - 1)
-            return false;
-
-        // \r\n - single unit for eof
-        if (remaining[endline] == '\r' && remaining[endline + 1] == '\n')
-            endline += 1;
-
-        part = remainingMemory.Slice(0, endline + 1);
-        remainingMemory = remainingMemory.Slice(endline + 1);
-
-        return true;
-    }
-
-    public static bool FindNextLine(ref ReadOnlySpan<char> remaining, ref ReadOnlySpan<char> part)
-    {
-        part = remaining;
-
-        var endOfLine = remaining.IndexOfAny('\r', '\n');
-
-        if (endOfLine == -1 || endOfLine == remaining.Length - 1)
-            return false;
-
-        // \r\n - single unit for eof
-        if (remaining[endOfLine] == '\r' && remaining[endOfLine + 1] == '\n')
-            endOfLine += 1;
-
-        part = remaining.Slice(0, endOfLine + 1);
-        remaining = remaining.Slice(endOfLine + 1);
-
-        return true;
-    }
-
-    public static bool IsAddedNewLine(this ReadOnlySpan<char> line)
-    {
-        return line is { Length: > 0 } && line[line.Length - 1] is '\r' or '\n';
-    }
-
-    public static bool IsAddedNewLine(this Span<char> line)
-    {
-        return line is { Length: > 0 } && line[line.Length - 1] is '\r' or '\n';
     }
 }
