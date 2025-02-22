@@ -98,9 +98,12 @@ internal sealed class AegisGen : IIncrementalGenerator
                 continue;
             }
 
-            int indentLevel = 0;
+            var writer = new IndentStackWriter(sourceCode);
+            
+            var typeNamespace = type.ContainingNamespace is { IsGlobalNamespace: false } ? type.ContainingNamespace : null;
 
-            sourceCode.Append("""
+            writer.AppendIndented(
+                $$"""
                 using System;
                 using System.Data;
                 using System.Data.Common;
@@ -108,41 +111,16 @@ internal sealed class AegisGen : IIncrementalGenerator
                 using System.Collections.ObjectModel;
                 using System.Runtime.CompilerServices;
 
-                """);
-            
-            var typeNamespace = type.ContainingNamespace is { IsGlobalNamespace: false } ? type.ContainingNamespace : null;
-
-            if (typeNamespace != null)
-            {
-                var namespaceString = typeNamespace.ToDisplayString();
-
-                sourceCode.Append($"namespace {namespaceString}")
-                    .AppendLine()
-                    .Append('{')
-                    .AppendLine()
-                    .Append('\t');
-
-                indentLevel += 1;
-            }
-
-            //var test = new StringBuilder();
-            var writer = new IndentStackWriter(sourceCode, indentLevel);
-
-            writer.AppendIndented($$"""
-                public sealed partial class {{type.Name}}AegisAgent
+                {{writer.ToSyntax([typeNamespace], (_, x) => x == null
+                ? _[AppendClass(_, type, matchCase, token)]
+                : _[$$"""
+                namespace {{x}}
                 {
-                    {{writer.ToSyntax([type], (w, t) => w[AppendReadList(writer, type)])}}
-
-                    {{writer.ToSyntax([type], (w, t) => w[AppendReadSchemaIndexes(writer, type)])}}
-
-                    {{writer.ToSyntax([type], (w, t) => w[AppendReadSchemaColumnIndex(writer, type, matchCase)])}}
+                    {{_[AppendClass(_, type, matchCase, token)]}}
                 }
+                """])
+                }}
                 """);
-
-            if(typeNamespace != null)
-            {
-                sourceCode.AppendLine().Append('}');
-            }
 
             if (token.IsCancellationRequested) return;
 
@@ -157,39 +135,21 @@ internal sealed class AegisGen : IIncrementalGenerator
         }
     }
 
-    internal static string AppendReadList(StringBuilder sourceCode, ITypeSymbol type, int indent = 0, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendClass(IndentStackWriter writer, ITypeSymbol type, int matchCases, CancellationToken token = default)
     {
-        var properties = type.GetSettableProperties().ToArray();
-        var writer = new IndentStackWriter(sourceCode, indent);
-
-        return writer.AppendIndented(
-            $$"""
-            
-            internal static List<{{type.Name}}> ReadList<TReader>(TReader reader)
-                where TReader : IDataReader
+        return writer[$$"""
+            public sealed partial class {{type.Name}}AegisAgent
             {
-                var result = new List<{{type.Name}}>();
-            
-                ReadSchemaIndexes(reader{{properties.Select(x => $", out var col{x.Name}")}});
-            
-                while(reader.Read())
-                {
-                    var parsed = new {{type.Name}}();
-            
-                    {{writer.ToSyntax(properties, (w, x) => x.Type.IsReferenceType
-                        ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.ToDisplayString()};"]
-                        : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.ToDisplayString()} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
-                        joinBy: "\n")}}
+                {{writer.ToSyntax([type], (w, t) => w[AppendReadList(writer, type)])}}
 
-                    result.Add(parsed);
-                }
-            
-                return result;
+                {{writer.ToSyntax([type], (w, t) => w[AppendReadSchemaIndexes(writer, type)])}}
+
+                {{writer.ToSyntax([type], (w, t) => w[AppendReadSchemaColumnIndex(writer, type, matchCases)])}}
             }
-            """);
+            """];
     }
 
-    internal static IndentedInterpolatedStringHandler AppendReadList(IndentStackWriter writer, ITypeSymbol type, int indent = 0, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendReadList(IndentStackWriter writer, ITypeSymbol type, CancellationToken token = default)
     {
         var properties = type.GetSettableProperties().ToArray();
 
@@ -219,7 +179,7 @@ internal sealed class AegisGen : IIncrementalGenerator
             """];
     }
 
-    internal static IndentedInterpolatedStringHandler AppendReadSchemaIndexes(IndentStackWriter writer, ITypeSymbol type, int indent = 0, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendReadSchemaIndexes(IndentStackWriter writer, ITypeSymbol type, CancellationToken token = default)
     {
         var properties = type.GetSettableProperties().ToArray();
 
@@ -238,7 +198,7 @@ internal sealed class AegisGen : IIncrementalGenerator
             """];
     }
 
-    internal static IndentedInterpolatedStringHandler AppendReadSchemaColumnIndex(IndentStackWriter writer, ITypeSymbol type, int matchCases, int indent = 0, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendReadSchemaColumnIndex(IndentStackWriter writer, ITypeSymbol type, int matchCases, CancellationToken token = default)
     {
         if (token.IsCancellationRequested) return default;
 
@@ -697,6 +657,24 @@ internal static class StringBuilderExtensions
 
 internal static class EnumerableExntensions
 {
+    internal static SingleSyntax<T> ToSyntax<T>(
+        this IndentStackWriter writer,
+        T source,
+        Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> cast
+        )
+    {
+        return new(writer, source, cast);
+    }
+
+    internal static SingleStringSyntax<T> ToSyntax<T>(
+        this IndentStackWriter writer,
+        T source,
+        Func<IndentStackWriter, T, string> cast
+        )
+    {
+        return new(writer, source, cast);
+    }
+
     internal static RepeatableSyntax<T> ToSyntax<T>(
         this IndentStackWriter writer,
         IEnumerable<T> source,
@@ -705,6 +683,76 @@ internal static class EnumerableExntensions
         )
     {
         return new(writer, source, cast, joinBy.AsMemory());
+    }
+
+    internal static RepeatableStringsSyntax<T> ToSyntax<T>(
+        this IndentStackWriter writer,
+        IEnumerable<T> source,
+        Func<IndentStackWriter, T, string> cast,
+        string joinBy = "\n\n"
+        )
+    {
+        return new(writer, source, cast, joinBy.AsMemory());
+    }
+}
+
+internal readonly struct SingleSyntax<T>(IndentStackWriter writer, T source, Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> write)
+{
+    private readonly IndentStackWriter _writer = writer;
+    private readonly T _source = source;
+    private readonly Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> _write = write;
+
+    [DebuggerHidden]
+    public readonly override string ToString()
+    {
+        var lastLine = _writer.LastLine.Span;
+
+        bool addedIndent;
+        if (addedIndent = !lastLine.IsEmpty && !lastLine.IsAddedNewLine() && lastLine.IsWhiteSpace())
+        {
+            _writer.AddIndent(lastLine);
+        }
+
+        _write(_writer, _source);
+
+        if (addedIndent)
+        {
+            _writer.PopIndent();
+        }
+
+        return string.Empty;
+    }
+}
+
+internal readonly struct SingleStringSyntax<T>(IndentStackWriter writer, T source, Func<IndentStackWriter, T, string> cast)
+{
+    private readonly IndentStackWriter _writer = writer;
+    private readonly T _source = source;
+    private readonly Func<IndentStackWriter, T, string> _cast = cast;
+
+    [DebuggerHidden]
+    public readonly override string ToString()
+    {
+        var lastLine = _writer.LastLine.Span;
+
+        if (_source is null) return string.Empty;
+
+        bool addedIndent;
+        if (addedIndent = !lastLine.IsEmpty && !lastLine.IsAddedNewLine() && lastLine.IsWhiteSpace())
+        {
+            _writer.AddIndent(lastLine);
+        }
+        
+        var stringValue = _cast(_writer, _source);
+
+        _writer.AppendLineSplitted(stringValue.AsSpan());
+
+        if (addedIndent)
+        {
+            _writer.PopIndent();
+        }
+
+        return string.Empty;
     }
 }
 
@@ -725,7 +773,7 @@ internal readonly struct RepeatableSyntax<T>(IndentStackWriter writer, IEnumerab
         if (!enumerator.MoveNext()) return string.Empty;
 
         bool addedIndent;
-        if (addedIndent = !lastLine.IsEmpty && lastLine.IsWhiteSpace())
+        if (addedIndent = !lastLine.IsEmpty && !lastLine.IsAddedNewLine() && lastLine.IsWhiteSpace())
         {
             _writer.AddIndent(lastLine);
         }
@@ -746,6 +794,53 @@ internal readonly struct RepeatableSyntax<T>(IndentStackWriter writer, IEnumerab
         } while (!end);
 
         if(addedIndent)
+        {
+            _writer.PopIndent();
+        }
+
+        return string.Empty;
+    }
+}
+
+internal readonly struct RepeatableStringsSyntax<T>(IndentStackWriter writer, IEnumerable<T> source, Func<IndentStackWriter, T, string> cast, ReadOnlyMemory<char> joinBy = default)
+{
+    private readonly IndentStackWriter _writer = writer;
+    private readonly IEnumerable<T> _source = source;
+    private readonly Func<IndentStackWriter, T, string> _cast = cast;
+    private readonly ReadOnlyMemory<char> _joinBy = joinBy;
+
+    [DebuggerHidden]
+    public readonly override string ToString()
+    {
+        var lastLine = _writer.LastLine.Span;
+
+        using var enumerator = _source.GetEnumerator();
+
+        if (!enumerator.MoveNext()) return string.Empty;
+
+        bool addedIndent;
+        if (addedIndent = !lastLine.IsEmpty && !lastLine.IsAddedNewLine() && lastLine.IsWhiteSpace())
+        {
+            _writer.AddIndent(lastLine);
+        }
+
+        bool end;
+        var previous = enumerator.Current;
+
+        do
+        {
+            var str = _cast(_writer, previous);
+            _writer.AppendLineSplitted(str.AsSpan());
+
+            if (end = !enumerator.MoveNext()) continue;
+
+            _writer.AppendLineSplitted(_joinBy.Span);
+
+            previous = enumerator.Current;
+
+        } while (!end);
+
+        if (addedIndent)
         {
             _writer.PopIndent();
         }
@@ -837,9 +932,7 @@ internal class IndentStackWriter
 
     public ReadOnlyMemory<char> LastLine => _lastLine.AsMemory();
 
-    public bool IsLastAddedLine => IsAddedNewLine(_lastLine.AsSpan());
-        //=> LastLine is { Length: > 0 } last &&
-        //   last.Span[last.Length - 1] is '\r' or '\n';
+    public bool IsLastAddedLine => _lastLine.AsSpan().IsAddedNewLine();
 
     public IndentedInterpolatedStringHandler Write([InterpolatedStringHandlerArgument("")] IndentedInterpolatedStringHandler handler)
     {
@@ -847,6 +940,14 @@ internal class IndentStackWriter
     }
 
     public IndentedInterpolatedStringHandler this[[InterpolatedStringHandlerArgument("")] IndentedInterpolatedStringHandler val] => val;
+
+    public string this[string simpleString] => new SingleSyntax<string>(this, simpleString, static (w, s) => w[$"{s}"]).ToString();
+
+    public string this[object source, Func<IndentStackWriter, object, IndentedInterpolatedStringHandler> cast, string joinBy = "\n\n"]
+        => new SingleSyntax<object>(this, source, cast).ToString();
+
+    public string this[IEnumerable<object> source, Func<IndentStackWriter, object, IndentedInterpolatedStringHandler> cast, string joinBy = "\n\n"]
+        => new RepeatableSyntax<object>(this, source, cast, joinBy.AsMemory()).ToString();
 
     public void AppendLineSplitted(ReadOnlySpan<char> source)
     {
@@ -876,7 +977,7 @@ internal class IndentStackWriter
             _sourceCode.Append(line);
             last = line;
 
-            if(noLineAdded && IsAddedNewLine(line))
+            if(noLineAdded && line.IsAddedNewLine())
             {
                 noLineAdded = false;
             }
@@ -1047,11 +1148,6 @@ internal class IndentStackWriter
         var newSize = (current * 3) >> 1;
         return Math.Max(newSize, atLeast);
     }
-
-    private static bool IsAddedNewLine(ReadOnlySpan<char> line)
-    {
-        return line is { Length: > 0 } && line[line.Length - 1] is '\r' or '\n';
-    }
 }
 
 public static class LineSplitter
@@ -1093,5 +1189,15 @@ public static class LineSplitter
         remaining = remaining.Slice(endOfLine + 1);
 
         return true;
+    }
+
+    public static bool IsAddedNewLine(this ReadOnlySpan<char> line)
+    {
+        return line is { Length: > 0 } && line[line.Length - 1] is '\r' or '\n';
+    }
+
+    public static bool IsAddedNewLine(this Span<char> line)
+    {
+        return line is { Length: > 0 } && line[line.Length - 1] is '\r' or '\n';
     }
 }
