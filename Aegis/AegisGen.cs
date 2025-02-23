@@ -65,7 +65,7 @@ internal sealed class AegisGen : IIncrementalGenerator
             };
         }
 
-        static (INamedTypeSymbol? symbol, AegisAttributeParse parser) transform(GeneratorAttributeSyntaxContext gen, CancellationToken token)
+        static MatchingModel? transform(GeneratorAttributeSyntaxContext gen, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
             var src = AegisAttributeGenerator.MarkerAttributeSourceCode;
@@ -74,11 +74,39 @@ internal sealed class AegisGen : IIncrementalGenerator
             var parser = new AegisAttributeParse(attributeInstance);
             var symbol = gen.TargetSymbol as INamedTypeSymbol;
 
-            return (symbol, parser);
+            if(gen.TargetSymbol is not INamedTypeSymbol target)
+            {
+                return default;
+            }
+
+            ImmutableArray<SettableProperty> properties = target.GetMembers()
+                .Where(member => member is IPropertySymbol)
+                .Select(member => (IPropertySymbol)member)
+                .Where(property => !property.IsReadOnly)
+                .Select((property, i) =>
+                {
+                    var type = property.Type;
+                    var typeNamespace = type.ContainingNamespace;
+
+                    var namespaceSnapshot = new NamespaceSnapshot(typeNamespace.Name, typeNamespace.ToDisplayString(), typeNamespace.IsGlobalNamespace);
+                    var typeSnapshot = new TypeSnapshot(type.Name, type.ToDisplayString(), type.IsReferenceType, namespaceSnapshot);
+
+                    return new SettableProperty(property.Name, typeSnapshot, i, property.IsRequired);
+                })
+                .ToImmutableArray();
+
+            var targetNamespace = target.ContainingNamespace;
+
+            var namespaceSnapshot = new NamespaceSnapshot(targetNamespace.Name, targetNamespace.ToDisplayString(), targetNamespace.IsGlobalNamespace);
+            var typeSnapshot = new TypeSnapshot(target.Name, target.ToDisplayString(), target.IsReferenceType, namespaceSnapshot);
+
+            var targetModel = new MatchingModel(typeSnapshot, properties, new MatchingSettings(parser.MatchCasePropertyValue ?? -1));
+
+            return targetModel;
         }
     }
 
-    private static void GenerateDataReaderParsers(SourceProductionContext productionContext, ImmutableArray<(INamedTypeSymbol? symbol, AegisAttributeParse parser)> types)
+    private static void GenerateDataReaderParsers(SourceProductionContext productionContext, ImmutableArray<MatchingModel?> models)
     {
         var token = productionContext.CancellationToken;
 
@@ -87,21 +115,23 @@ internal sealed class AegisGen : IIncrementalGenerator
 
         var sourceCode = new StringBuilder();
 
-        foreach (var (type, parser) in types)
+        foreach (var model in models)
         {
             if (token.IsCancellationRequested) return;
 
-            if (type == null) continue;
+            if (model == null) continue;
 
-            if (parser.MatchCasePropertyValue is not int matchCase ||
-                !MatchCaseGenerator.IsValid(matchCase))
+            var matchCase = model.Value.MatchingSettings.MatchCase;
+
+            if (!MatchCaseGenerator.IsValid(matchCase))
             {
                 continue;
             }
 
+            var type = model.Value.Type;
             var _ = new IndentStackWriter(sourceCode);
             
-            var typeNamespace = type.ContainingNamespace is { IsGlobalNamespace: false } ? type.ContainingNamespace : null;
+            var typeNamespace = !type.Namespace.IsGlobal ? type.Namespace.DisplayString : null;
 
             var ignore = _[$$"""
                 using System;
@@ -113,11 +143,11 @@ internal sealed class AegisGen : IIncrementalGenerator
 
                 {{_[
                     typeNamespace == null
-                    ? AppendClass(_, type, matchCase, token)
+                    ? AppendClass(_, model.Value, token)
                     : _[$$""" 
                         namespace {{typeNamespace}}
                         {
-                            {{_.Scope[AppendClass(_, type, matchCase, token)]}}
+                            {{_.Scope[AppendClass(_, model.Value, token)]}}
                         }
                         """
                     ]
@@ -138,23 +168,24 @@ internal sealed class AegisGen : IIncrementalGenerator
         }
     }
 
-    internal static IndentedInterpolatedStringHandler AppendClass(IndentStackWriter _, ITypeSymbol type, int matchCases, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendClass(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
         return _[$$"""
-            public sealed partial class {{type.Name}}AegisAgent
+            public sealed partial class {{model.Type.Name}}AegisAgent
             {
-                {{_.Scope[AppendReadList(_, type)]}}
+                {{_.Scope[AppendReadList(_, model)]}}
 
-                {{_.Scope[AppendReadSchemaIndexes(_, type)]}}
+                {{_.Scope[AppendReadSchemaIndexes(_, model)]}}
 
-                {{_.Scope[AppendReadSchemaColumnIndex(_, type, matchCases)]}}
+                {{_.Scope[AppendReadSchemaColumnIndex(_, model)]}}
             }
             """];
     }
 
-    internal static IndentedInterpolatedStringHandler AppendReadList(IndentStackWriter writer, ITypeSymbol type, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendReadList(IndentStackWriter writer, MatchingModel model, CancellationToken token = default)
     {
-        var properties = type.GetSettableProperties().ToArray();
+        var properties = model.Properties;
+        var type = model.Type;
 
         return writer[
             $$"""
@@ -169,9 +200,9 @@ internal sealed class AegisGen : IIncrementalGenerator
                 {
                     var parsed = new {{type.Name}}();
             
-                    {{writer.Scope.ForEach(properties, (w, x) => x.Type.IsReferenceType
-                        ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.ToDisplayString()};"]
-                        : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.ToDisplayString()} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
+                    {{writer.Scope.ForEach(properties, (w, x) => x.Type.IsReference
+                        ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"]
+                        : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.DisplayString} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
                         joinBy: "\n")}}
 
                     result.Add(parsed);
@@ -182,9 +213,10 @@ internal sealed class AegisGen : IIncrementalGenerator
             """];
     }
 
-    internal static IndentedInterpolatedStringHandler AppendReadSchemaIndexes(IndentStackWriter writer, ITypeSymbol type, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendReadSchemaIndexes(IndentStackWriter writer, MatchingModel model, CancellationToken token = default)
     {
-        var properties = type.GetSettableProperties().ToArray();
+        var properties = model.Properties;
+        var type = model.Type;
 
         return writer[
             $$"""
@@ -201,13 +233,47 @@ internal sealed class AegisGen : IIncrementalGenerator
             """];
     }
 
-    internal static IndentedInterpolatedStringHandler AppendReadSchemaColumnIndex(IndentStackWriter writer, ITypeSymbol type, int matchCases, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendReadSchemaColumnIndex(IndentStackWriter writer, MatchingModel model, CancellationToken token = default)
+    {
+        var properties = model.Properties;
+        var matchCases = model.MatchingSettings.MatchCase;
+
+        var namesToMatch = GetNamesToMatch(model, token);
+
+        return writer[
+            $$"""
+            internal static void ReadSchemaColumnIndex(string c, int i{{properties.Select(x => $", ref int col{x.Name}")}})
+            {
+                switch(c.Length)
+                {
+                    {{writer.Scope.ForEach(namesToMatch, (_, n) => _[$$"""
+                    case {{n.Key}}:
+                        {{writer.Scope.ForEach(n.Value, (_, x) => _[$$"""
+                            {{(MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase)
+                        ? $"if(col{x.property.Name} == -1 && string.Equals(c, \"{x.name}\", StringComparison.OrdinalIgnoreCase))"
+                        : $"if(col{x.property.Name} == -1 && c == \"{x.name}\")")}}
+                            {
+                                col{{x.property.Name}} = i;
+                                return;
+                            }
+                            """])}}
+                        break;
+                    """])
+                    }}
+                }
+            }
+            """];
+    }
+
+    internal static new SortedDictionary<int, List<(string name, SettableProperty property)>> GetNamesToMatch(MatchingModel model, CancellationToken token = default)
     {
         if (token.IsCancellationRequested) return default;
 
-        var properties = type.GetSettableProperties().ToArray();
+        var properties = model.Properties;
+        var type = model.Type;
+        var matchCases = model.MatchingSettings.MatchCase;
 
-        var namesToMatch = new SortedDictionary<int, List<(string name, IPropertySymbol property)>>();
+        var namesToMatch = new SortedDictionary<int, List<(string name, SettableProperty property)>>();
         var names = new List<string>();
 
         foreach (var property in properties)
@@ -292,28 +358,7 @@ internal sealed class AegisGen : IIncrementalGenerator
             sameLengthNames.Value.Sort((x, y) => StringComparer.OrdinalIgnoreCase.Compare(x.name, y.name));
         }
 
-        return writer[
-            $$"""
-            internal static void ReadSchemaColumnIndex(string c, int i{{properties.Select(x => $", ref int col{x.Name}")}})
-            {
-                switch(c.Length)
-                {
-                    {{writer.Scope.ForEach(namesToMatch, (_, n) => _[$$"""
-                    case {{n.Key}}:
-                        {{writer.Scope.ForEach(n.Value, (_, x) => _[$$"""
-                            {{(MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase)
-                        ? $"if(col{x.property.Name} == -1 && string.Equals(c, \"{x.name}\", StringComparison.OrdinalIgnoreCase))"
-                        : $"if(col{x.property.Name} == -1 && c == \"{x.name}\")")}}
-                            {
-                                col{{x.property.Name}} = i;
-                                return;
-                            }
-                            """])}}
-                        break;
-                    """])}}
-                }
-            }
-            """];
+        return namesToMatch;
     }
 
     internal static bool TryGetSettableProperty(ISymbol? member, [NotNullWhen(true)] out IPropertySymbol? settableProperty)
@@ -561,7 +606,7 @@ internal readonly struct SettableProperties(ImmutableArray<ISymbol> properties, 
         var count = 0;
 
         for (int i = 0; i != _properties.Length && !_token.IsCancellationRequested; i++)
-            count += _properties[i].IsSettableProperty(out _) ? 1 : 0;
+            count += _properties[i].TryGetSettableProperty(out _) ? 1 : 0;
 
         return count;
     }
@@ -576,7 +621,7 @@ internal readonly struct SettableProperties(ImmutableArray<ISymbol> properties, 
         
         for(int i = 0; i != _properties.Length && !_token.IsCancellationRequested; i++)
         {
-            if (_properties[i].IsSettableProperty(out var settableProperty))
+            if (_properties[i].TryGetSettableProperty(out var settableProperty))
                 properties[++writeIndex] = settableProperty;
         }
 
@@ -606,7 +651,7 @@ internal readonly struct SettableProperties(ImmutableArray<ISymbol> properties, 
             while(++_index < _source.Length && !_token.IsCancellationRequested)
             {
                 var member = _source[_index];
-                if (member.IsSettableProperty(out var property))
+                if (member.TryGetSettableProperty(out var property))
                 {
                     Current = property;
                     return true;
@@ -626,7 +671,7 @@ internal static class SymbolExtensions
     public static SettableProperties GetSettableProperties(this INamedTypeSymbol type, CancellationToken token = default)
         => new(type.GetMembers(), token);
 
-    public static bool IsSettableProperty(this ISymbol member, [NotNullWhen(true)] out IPropertySymbol? settableProperty)
+    public static bool TryGetSettableProperty(this ISymbol member, [NotNullWhen(true)] out IPropertySymbol? settableProperty)
     {
         (bool result, settableProperty) = member switch
         {
@@ -636,4 +681,56 @@ internal static class SymbolExtensions
 
         return result;
     }
+}
+
+internal readonly struct MatchingModel
+{
+    public readonly TypeSnapshot Type;
+    public readonly ImmutableArray<SettableProperty> Properties;
+    public readonly MatchingSettings MatchingSettings;
+
+    public MatchingModel(TypeSnapshot type, ImmutableArray<SettableProperty> properties, MatchingSettings matchingSettings)
+        => (Type, Properties, MatchingSettings) = (type, properties, matchingSettings);
+}
+
+internal readonly struct SettableProperty
+{
+    public readonly TypeSnapshot Type;
+    public readonly string Name;
+    public readonly int DeclarationOrder;
+    public readonly bool Required;
+
+    public SettableProperty(string name, TypeSnapshot type, int declarationOrder, bool required)
+        => (Name, Type, DeclarationOrder, Required)
+        = (name, type, declarationOrder, required);
+}
+
+internal readonly struct TypeSnapshot
+{
+    public readonly NamespaceSnapshot Namespace;
+    public readonly string Name;
+    public readonly string DisplayString;
+    public readonly bool IsReference;
+
+    public TypeSnapshot(string name, string displayString, bool isReference, NamespaceSnapshot namespaceShapshot)
+        => (Name, DisplayString, IsReference, Namespace)
+        = (name, displayString, isReference, namespaceShapshot);
+}
+
+internal readonly struct NamespaceSnapshot
+{
+    public readonly string Name;
+    public readonly string DisplayString;
+    public readonly bool IsGlobal;
+
+    public NamespaceSnapshot(string name, string display, bool isGlobal)
+        => (Name, DisplayString, IsGlobal) = (name, display, isGlobal);
+}
+
+internal readonly struct MatchingSettings
+{
+    public readonly int MatchCase;
+
+    public MatchingSettings(int matchCase)
+        => (MatchCase) = (matchCase);
 }

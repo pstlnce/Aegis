@@ -33,6 +33,7 @@ internal sealed class IndentStackWriter
 
     public bool IsLastAddedLine => _lastLine.AsSpan().IsAddedNewLine();
 
+    /// <summary> Don't store in variable to reuse </summary>
     public IndentScopeHook Scope => new(this);
 
     public IndentedInterpolatedStringHandler this[[InterpolatedStringHandlerArgument("")] IndentedInterpolatedStringHandler value] => value;
