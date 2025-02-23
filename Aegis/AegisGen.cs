@@ -1,4 +1,5 @@
 ﻿using Aegis.IndentWriter;
+using Aegis.Options;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -11,7 +12,6 @@ using System.Linq;
 using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace Aegis;
@@ -100,7 +100,7 @@ internal sealed class AegisGen : IIncrementalGenerator
             var namespaceSnapshot = new NamespaceSnapshot(targetNamespace.Name, targetNamespace.ToDisplayString(), targetNamespace.IsGlobalNamespace);
             var typeSnapshot = new TypeSnapshot(target.Name, target.ToDisplayString(), target.IsReferenceType, namespaceSnapshot);
 
-            var targetModel = new MatchingModel(typeSnapshot, properties, new MatchingSettings(parser.MatchCasePropertyValue ?? -1));
+            var targetModel = new MatchingModel(typeSnapshot, properties, new MatchingSettings(parser.MatchCasePropertyValue == null ? MatchCase.None : (MatchCase)parser.MatchCasePropertyValue));
 
             return targetModel;
         }
@@ -123,7 +123,7 @@ internal sealed class AegisGen : IIncrementalGenerator
 
             var matchCase = model.Value.MatchingSettings.MatchCase;
 
-            if (!MatchCaseGenerator.IsValid(matchCase))
+            if (matchCase <= MatchCase.None)
             {
                 continue;
             }
@@ -161,8 +161,8 @@ internal sealed class AegisGen : IIncrementalGenerator
             sourceCode.Clear();
 
             var fileName = typeNamespace != null
-                ? $"{typeNamespace}.{type.Name}AegisAgent.g.cs"
-                : $"{type.Name}AegisAgent.g.cs";
+                ? $"{typeNamespace}.{type.Name}Parser.g.cs"
+                : $"{type.Name}Parser.g.cs";
 
             productionContext.AddSource(fileName, sourceCodeText);
         }
@@ -171,7 +171,7 @@ internal sealed class AegisGen : IIncrementalGenerator
     internal static IndentedInterpolatedStringHandler AppendClass(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
         return _[$$"""
-            public sealed partial class {{model.Type.Name}}AegisAgent
+            public sealed partial class {{model.Type.Name}}Parser
             {
                 {{_.Scope[AppendReadList(_, model)]}}
 
@@ -249,7 +249,7 @@ internal sealed class AegisGen : IIncrementalGenerator
                     {{writer.Scope.ForEach(namesToMatch, (_, n) => _[$$"""
                     case {{n.Key}}:
                         {{writer.Scope.ForEach(n.Value, (_, x) => _[$$"""
-                            {{(MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase)
+                            {{(matchCases.HasFlag(MatchCase.IgnoreCase)
                         ? $"if(col{x.property.Name} == -1 && string.Equals(c, \"{x.name}\", StringComparison.OrdinalIgnoreCase))"
                         : $"if(col{x.property.Name} == -1 && c == \"{x.name}\")")}}
                             {
@@ -280,12 +280,12 @@ internal sealed class AegisGen : IIncrementalGenerator
         {
             if (token.IsCancellationRequested) return [];
 
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase))
+            if (matchCases.HasFlag(MatchCase.IgnoreCase))
             {
                 var lowerCase =
-                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.MatchOriginal) ||
-                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Camel) ||
-                    MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Pascal)
+                    matchCases.HasFlag(MatchCase.MatchOriginal) ||
+                    matchCases.HasFlag(MatchCase.CamalCase) ||
+                    matchCases.HasFlag(MatchCase.PascalCase)
                     ? property.Name.ToLower()
                     : null;
 
@@ -299,7 +299,7 @@ internal sealed class AegisGen : IIncrementalGenerator
                     sameLength.Add((lowerCase, property));
                 }
 
-                var snake = MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Snake)
+                var snake = matchCases.HasFlag(MatchCase.SnakeCase)
                     ? MatchCaseGenerator.ToSnakeCase(property.Name)
                     : null;
 
@@ -316,25 +316,25 @@ internal sealed class AegisGen : IIncrementalGenerator
                 continue;
             }
 
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.MatchOriginal))
+            if (matchCases.HasFlag(MatchCase.MatchOriginal))
             {
                 var original = property.Name;
                 names.Add(original);
             }
 
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Snake))
+            if (matchCases.HasFlag(MatchCase.SnakeCase))
             {
                 var snake = MatchCaseGenerator.ToSnakeCase(property.Name);
                 if (!names.Contains(snake)) names.Add(snake);
             }
 
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Camel))
+            if (matchCases.HasFlag(MatchCase.CamalCase))
             {
                 var camel = MatchCaseGenerator.ToCamelCase(property.Name);
                 if (!names.Contains(camel)) names.Add(camel);
             }
 
-            if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.Pascal))
+            if (matchCases.HasFlag(MatchCase.PascalCase))
             {
                 var pascal = MatchCaseGenerator.ToPascalCase(property.Name);
                 if (!names.Contains(pascal)) names.Add(pascal);
@@ -372,187 +372,6 @@ internal sealed class AegisGen : IIncrementalGenerator
 
         settableProperty = null;
         return false;
-    }
-}
-
-internal static class AegisAttributeGenerator
-{
-    public const string AttributeName = "AegisAgentAttribute";
-    public const string Namespace = "Aegis";
-    public const string AttributeFullName = $"{Namespace}.{AttributeName}";
-
-    public const string ClassNameProperty = "ClassName";
-    public const string MatchCaseProperty = "Case";
-
-    public static readonly (string name, int value) DefaultCase = (MatchCaseGenerator.AllName, MatchCaseGenerator.All);
-
-    public static readonly string MarkerAttributeSourceCode =
-@$"using System;
-
-namespace {Namespace}
-{{
-    [AttributeUsage(AttributeTargets.Class)]
-    internal sealed class {AttributeName} : Attribute
-    {{
-        public string? {ClassNameProperty} {{ get; set; }}
-        public {MatchCaseGenerator.EnumName} {MatchCaseProperty} {{ get; set; }} = {MatchCaseGenerator.EnumName}.{DefaultCase.name};
-    }}
-
-    {MatchCaseGenerator.MatchCaseEnum}
-}}
-";
-}
-
-internal static class MatchCaseGenerator
-{
-    public const string EnumName = "MatchCase";
-    public const string Namespace = AegisAttributeGenerator.Namespace;
-
-    public const int MatchOriginal = 1;
-    public const int IgnoreCase = 1 << 1;
-    public const int Snake = 1 << 2;
-    public const int Camel = 1 << 3;
-    public const int Pascal = 1 << 4;
-    public const int ApplyOnOverwritten = 1 << 5;
-    public const int All = MatchOriginal | IgnoreCase | Snake | Camel | Pascal | ApplyOnOverwritten;
-
-    public const int CamelAndPascal = Camel | Pascal;
-
-    public const string MatchOriginalName = nameof(MatchOriginal);
-    public const string IgnoreCaseName = nameof(IgnoreCase);
-    public const string SnakeName = nameof(Snake);
-    public const string CamalName = nameof(Camel);
-    public const string PascalName = nameof(Pascal);
-    public const string ApplyOnOverritenName = nameof(ApplyOnOverwritten);
-    public const string AllName = nameof(All);
-
-    public static readonly string MatchCaseEnum =
-@$"[Flags]
-    public enum {EnumName} : int
-    {{
-        {MatchOriginalName} = {MatchOriginal},
-        {IgnoreCaseName} = 1 << {(int)Math.Log(IgnoreCase, 2)},
-        {SnakeName} = 1 << {(int)Math.Log(Snake, 2)},
-        {CamalName} = 1 << {(int)Math.Log(Camel, 2)},
-        {PascalName} = 1 << {(int)Math.Log(Pascal, 2)},
-        {ApplyOnOverritenName} = 1 << {(int)Math.Log(ApplyOnOverwritten, 2)},
-        {AllName} = {MatchOriginalName} | {IgnoreCaseName} | {SnakeName} | {CamalName} | {PascalName} | {ApplyOnOverritenName}
-    }}
-";
-
-    public static bool HasFlag(int value, int flag)
-        => (value & flag) == flag;
-
-    public static bool IsValid(int caseValue)
-        => caseValue >= 0 && caseValue <= All;
-
-    public static int GetValueByName(string caseName) => caseName switch
-    {
-        IgnoreCaseName => IgnoreCase,
-        SnakeName => Snake,
-        CamalName => Camel,
-        PascalName => Pascal,
-        ApplyOnOverritenName => ApplyOnOverwritten,
-        AllName => All,
-        _ => -1,
-    };
-
-    public static readonly Regex _snake = new("([a-z])([A-Z])", RegexOptions.Compiled);
-
-    public static string ToSnakeCase(string value)
-    {
-        var snakeCase = _snake.Replace(value, "$1_$2").ToLower();
-        return snakeCase;
-    }
-
-    public static string ToPascalCase(string value)
-    {
-        var length = 0;
-
-        for (int i = 0; i < value.Length; i++)
-        {
-            if (char.IsLetterOrDigit(value[i]))
-            {
-                length += 1;
-            }
-        }
-
-        Span<char> span = length <= 1024 ? stackalloc char[length] : new char[length];
-
-        int writeIndex = 0;
-        bool newWord = true;
-
-        for (int i = 0; i < value.Length; i++)
-        {
-            var symbol = value[i];
-
-            if (!char.IsLetterOrDigit(symbol))
-            {
-                newWord = true;
-                continue;
-            }
-
-            if(newWord)
-            {
-                symbol = char.ToUpper(symbol);
-                newWord = false;
-            }
-            else
-            {
-                symbol = char.ToLower(symbol);
-            }
-
-            span[writeIndex++] = symbol;
-        }
-
-        var word = span.ToString();
-
-        return word;
-    }
-
-    public static string ToCamelCase(string value)
-    {
-        var length = 0;
-
-        for (int i = 0; i < value.Length; i++)
-        {
-            if (char.IsLetterOrDigit(value[i]))
-            {
-                length += 1;
-            }
-        }
-
-        Span<char> span = length <= 1024 ? stackalloc char[length] : new char[length];
-
-        int writeIndex = 0;
-        bool newWord = false;
-
-        for (int i = 0; i < value.Length; i++)
-        {
-            var symbol = value[i];
-
-            if (!char.IsLetterOrDigit(symbol))
-            {
-                newWord = true;
-                continue;
-            }
-
-            if (newWord)
-            {
-                symbol = char.ToUpper(symbol);
-                newWord = false;
-            }
-            else
-            {
-                symbol = char.ToLower(symbol);
-            }
-
-            span[writeIndex++] = symbol;
-        }
-
-        var word = span.ToString();
-
-        return word;
     }
 }
 
@@ -727,10 +546,15 @@ internal readonly struct NamespaceSnapshot
         => (Name, DisplayString, IsGlobal) = (name, display, isGlobal);
 }
 
+internal readonly struct GenerationSettings
+{
+    public readonly string ClassName;
+}
+
 internal readonly struct MatchingSettings
 {
-    public readonly int MatchCase;
+    public readonly MatchCase MatchCase;
 
-    public MatchingSettings(int matchCase)
+    public MatchingSettings(MatchCase matchCase)
         => (MatchCase) = (matchCase);
 }

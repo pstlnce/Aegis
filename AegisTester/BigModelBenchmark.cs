@@ -1334,7 +1334,7 @@ internal class BigModelBenchmark
         //var list = PersonAegisAgent.ReadList(dr);
         //var list = PersonAegisAgent.Read(dr).ToList();
         //var list = PersonAegisAgent.ReadList2(dr);
-        var list = PersonAegisAgent.ReadList(dr);
+        var list = PersonParser.ReadList(dr);
 
         return list;
     }

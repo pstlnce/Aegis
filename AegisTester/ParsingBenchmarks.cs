@@ -32,7 +32,7 @@ internal class ParsingBenchmarks
     public void Aegis()
     {
         var dr = _dt.CreateDataReader();
-        var list = TestClass2AegisAgent.ReadList(dr).ToList();
+        var list = TestClass2Parser.ReadList(dr).ToList();
     }
 
     static DataTable _dt;
@@ -98,14 +98,7 @@ public class Benchy
     public void Aegis()
     {
         var dr = _dt.CreateDataReader();
-        var list = TestClassAegisAgent.ReadList(dr);
-    }
-
-    [Benchmark]
-    public void Aegis_V3()
-    {
-        var dr = _dt.CreateDataReader();
-        var list = TestClassAegisAgent.ReadList(dr);
+        var list = TestClassParser.ReadList(dr);
     }
 
     static DataTable _dt;

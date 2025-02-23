@@ -27,7 +27,7 @@ source.Rows.Add("Map7", 7, "Description for map 7", DateTime.Now);
 
 DbDataReader reader = source.CreateDataReader();
 
-foreach (var item in MapperAegisAgent.ReadList(reader))
+foreach (var item in MapperParser.ReadList(reader))
 {
     Console.WriteLine(JsonSerializer.Serialize(item));
 }
