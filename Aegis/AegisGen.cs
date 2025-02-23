@@ -267,7 +267,7 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static new SortedDictionary<int, List<(string name, SettableProperty property)>> GetNamesToMatch(MatchingModel model, CancellationToken token = default)
     {
-        if (token.IsCancellationRequested) return default;
+        if (token.IsCancellationRequested) return [];
 
         var properties = model.Properties;
         var type = model.Type;
@@ -278,7 +278,7 @@ internal sealed class AegisGen : IIncrementalGenerator
 
         foreach (var property in properties)
         {
-            if (token.IsCancellationRequested) return default;
+            if (token.IsCancellationRequested) return [];
 
             if (MatchCaseGenerator.HasFlag(matchCases, MatchCaseGenerator.IgnoreCase))
             {
