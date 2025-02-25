@@ -140,6 +140,8 @@ internal sealed class AegisGen : IIncrementalGenerator
                 using System.Collections.Generic;
                 using System.Collections.ObjectModel;
                 using System.Runtime.CompilerServices;
+                using System.Threading;
+                using System.Threading.Tasks;
 
                 {{_[
                     typeNamespace == null
@@ -171,13 +173,53 @@ internal sealed class AegisGen : IIncrementalGenerator
     internal static IndentedInterpolatedStringHandler AppendClass(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
         return _[$$"""
-            public sealed partial class {{model.Type.Name}}Parser
+            internal sealed partial class {{model.Type.Name}}Parser
             {
                 {{_.Scope[AppendReadList(_, model)]}}
+
+                {{_.Scope[AppendReadUnbuffered(_, model)]}}
+
+                {{_.Scope[AppendReadListAsync(_, model, isValueTask: false, token)]}}
+
+                {{_.Scope[AppendReadListAsync(_, model, isValueTask: true, token)]}}
+
+                {{_.Scope[AppendReadUnbufferedAsync(_, model)]}}
 
                 {{_.Scope[AppendReadSchemaIndexes(_, model)]}}
 
                 {{_.Scope[AppendReadSchemaColumnIndex(_, model)]}}
+            }
+            """];
+    }
+
+    internal static IndentedInterpolatedStringHandler AppendReadUnbuffered(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
+    {
+        var properties = model.Properties;
+        var type = model.Type;
+
+        return _[
+            $$"""
+            internal static IEnumerable<{{type.Name}}> ReadUnbuffered<TReader>(TReader reader)
+                where TReader : IDataReader
+            {
+                if(!reader.Read())
+                {
+                    yield break;
+                }
+
+                ReadSchemaIndexes(reader{{properties.Select(x => $", out var col{x.Name}")}});
+            
+                do
+                {
+                    var parsed = new {{type.Name}}();
+            
+                    {{_.Scope.ForEach(properties, (w, x) => x.Type.IsReference
+                        ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"]
+                        : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.DisplayString} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
+                        joinBy: "\n")}}
+
+                    yield return parsed;
+                } while(reader.Read());
             }
             """];
     }
@@ -193,10 +235,15 @@ internal sealed class AegisGen : IIncrementalGenerator
                 where TReader : IDataReader
             {
                 var result = new List<{{type.Name}}>();
-            
+
+                if(!reader.Read())
+                {
+                    return result;
+                }
+
                 ReadSchemaIndexes(reader{{properties.Select(x => $", out var col{x.Name}")}});
             
-                while(reader.Read())
+                do
                 {
                     var parsed = new {{type.Name}}();
             
@@ -206,9 +253,98 @@ internal sealed class AegisGen : IIncrementalGenerator
                         joinBy: "\n")}}
 
                     result.Add(parsed);
+                } while(reader.Read());
+            
+                return result;
+            }
+            """];
+    }
+
+    internal static IndentedInterpolatedStringHandler AppendReadListAsync(IndentStackWriter _, MatchingModel model, bool isValueTask, CancellationToken token = default)
+    {
+        var properties = model.Properties;
+        var type = model.Type;
+
+        return _[
+            $$"""
+            {{_[isValueTask
+              ? _[$"internal static async ValueTask<List<{type.Name}>> ReadListAsyncValue<TReader>(TReader reader, CancellationToken token = default)"]
+              : _[$"internal static async Task<List<{type.Name}>> ReadListAsync<TReader>(TReader reader, CancellationToken token = default)"]
+            ]}}
+                where TReader : DbDataReader
+            {
+                var result = new List<{{type.Name}}>();
+
+                if(!(await reader.ReadAsync(token).ConfigureAwait(false)))
+                {
+                    return result;
+                }
+            
+                ReadSchemaIndexes(reader{{properties.Select(x => $", out var col{x.Name}")}});
+            
+                Task<bool> reading;
+
+                while(true)
+                {
+                    var parsed = new {{type.Name}}();
+            
+                    {{_.Scope.ForEach(properties, (w, x) => x.Type.IsReference
+                        ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"]
+                        : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.DisplayString} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
+                        joinBy: "\n")}}
+
+                    reading = reader.ReadAsync(token);
+
+                    result.Add(parsed);
+
+                    if(!(await reading.ConfigureAwait(false)))
+                    {
+                        break;
+                    }
                 }
             
                 return result;
+            }
+            """];
+    }
+
+    internal static IndentedInterpolatedStringHandler AppendReadUnbufferedAsync(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
+    {
+        var properties = model.Properties;
+        var type = model.Type;
+
+        return _[
+            $$"""
+            internal static async IAsyncEnumerable<{{type.Name}}> ReadUnbufferedAsync<TReader>(TReader reader, [EnumeratorCancellationAttribute] CancellationToken token = default)
+                where TReader : DbDataReader
+            {
+                if(!(await reader.ReadAsync(token).ConfigureAwait(false)))
+                {
+                    yield break;
+                }
+
+                ReadSchemaIndexes(reader{{properties.Select(x => $", out var col{x.Name}")}});
+            
+                Task<bool> reading;
+
+                while(true)
+                {
+                    var parsed = new {{type.Name}}();
+            
+                    {{_.Scope.ForEach(properties, (w, x) => x.Type.IsReference
+                        ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"]
+                        : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.DisplayString} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
+                        joinBy: "\n")}}
+
+                    reading = reader.ReadAsync(token);
+
+                    yield return parsed;
+
+                    if(!(await reading.ConfigureAwait(false)))
+                    {
+                        break;
+                    }
+                }
             }
             """];
     }
