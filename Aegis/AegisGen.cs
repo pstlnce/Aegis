@@ -10,6 +10,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Linq.Expressions;
+using System.Reflection.Metadata;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
@@ -79,12 +80,23 @@ internal sealed class AegisGen : IIncrementalGenerator
                 return default;
             }
 
+
             ImmutableArray<SettableProperty> properties = target.GetMembers()
-                .Where(member => member is IPropertySymbol)
-                .Select(member => (IPropertySymbol)member)
-                .Where(property => !property.IsReadOnly)
+                .Where(static member => member is IPropertySymbol)
+                .Select(static member => (IPropertySymbol)member)
+                .Where(static property => !property.IsReadOnly)
                 .Select((property, i) =>
                 {
+                    var fielSourcedAttribute = property.GetAttributes().FirstOrDefault(attribute =>
+                            attribute.AttributeClass?.ContainingNamespace.Name == AegisAttributeGenerator.Namespace
+                            && attribute.AttributeClass.Name == FieldSourceAttrubteGenerator.AttributeName);
+
+                    if(fielSourcedAttribute != null)
+                    {
+                        var a = new FieldSourceAttributeParse(fielSourcedAttribute);
+                        a.Debug();
+                    }
+
                     var type = property.Type;
                     var typeNamespace = type.ContainingNamespace;
 
@@ -548,93 +560,31 @@ internal readonly struct AegisAttributeParse(AttributeData source)
     }
 }
 
-internal readonly struct SettableProperties(ImmutableArray<ISymbol> properties, CancellationToken token = default)
+internal readonly struct FieldSourceAttributeParse(AttributeData source)
 {
-    private readonly ImmutableArray<ISymbol> _properties = properties;
-    private readonly CancellationToken _token = token;
+    private readonly AttributeData _source = source;
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public Enumerator GetEnumerator() => new(_properties, _token);
-
-    public int Count()
+    public void Debug()
     {
-        var count = 0;
-
-        for (int i = 0; i != _properties.Length && !_token.IsCancellationRequested; i++)
-            count += _properties[i].TryGetSettableProperty(out _) ? 1 : 0;
-
-        return count;
-    }
-
-    public IPropertySymbol[] ToArray()
-    {
-        var count = Count();
-
-        var properties = new IPropertySymbol[count];
-
-        var writeIndex = -1;
-        
-        for(int i = 0; i != _properties.Length && !_token.IsCancellationRequested; i++)
+        for (int i = 0; i != _source.ConstructorArguments.Length; i++)
         {
-            if (_properties[i].TryGetSettableProperty(out var settableProperty))
-                properties[++writeIndex] = settableProperty;
-        }
-
-        return properties;
-    }
-
-    public struct Enumerator(ImmutableArray<ISymbol> source, CancellationToken token)
-    {
-        private int _index = -1;
-
-        private ImmutableArray<ISymbol> _source = source;
-
-        private readonly CancellationToken _token = token;
-
-        public IPropertySymbol Current { get; private set; } = null!;
-
-        [MemberNotNullWhen(true, nameof(Current))]
-        public bool MoveNext()
-        {
-            Current = null!;
-
-            if (_token.IsCancellationRequested || _index >= _source.Length)
-            {
-                return false;
-            }
-
-            while(++_index < _source.Length && !_token.IsCancellationRequested)
-            {
-                var member = _source[_index];
-                if (member.TryGetSettableProperty(out var property))
-                {
-                    Current = property;
-                    return true;
-                }
-            }
-
-            return false;
+            var argument = _source.ConstructorArguments[i];
         }
     }
-}
 
-internal static class SymbolExtensions
-{
-    public static SettableProperties GetSettableProperties(this ITypeSymbol type, CancellationToken token = default)
-        => new(type.GetMembers(), token);
-
-    public static SettableProperties GetSettableProperties(this INamedTypeSymbol type, CancellationToken token = default)
-        => new(type.GetMembers(), token);
-
-    public static bool TryGetSettableProperty(this ISymbol member, [NotNullWhen(true)] out IPropertySymbol? settableProperty)
+    private TypedConstant? FindNamedArg(string parameter)
     {
-        (bool result, settableProperty) = member switch
+        for (int i = 0; i != _source.NamedArguments.Length; i++)
         {
-            IPropertySymbol property when !property.IsReadOnly => (true, property),
-            _ => (false, null)
-        };
+            var argument = _source.NamedArguments[i];
 
-        return result;
+            if (argument.Key == parameter)
+            {
+                return argument.Value;
+            }
+        }
+
+        return default;
     }
 }
 

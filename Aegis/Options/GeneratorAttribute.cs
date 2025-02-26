@@ -27,8 +27,25 @@ namespace {Namespace}
         public {MatchCaseGenerator.EnumName} {MatchCaseProperty} {{ get; set; }} = {MatchCaseGenerator.EnumName}.{DefaultCase.name};
     }}
 
+    {FieldSourceAttrubteGenerator.SourceCode}
+
     {MatchCaseGenerator.MatchCaseEnum}
 }}";
+}
+
+internal sealed class FieldSourceAttrubteGenerator
+{
+    public const string AttributeName = "FieldSourceAttribute";
+
+    public static readonly string SourceCode =
+$@"[AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+    internal sealed class {AttributeName} : Attribute
+    {{
+        public {AttributeName}(string singleField) {{}}
+        public {AttributeName}(string[] multipleField) {{}}
+        public {AttributeName}(int fieldOrder) {{}}
+        public {AttributeName}(object[] fieldOrderOrName) {{}}
+    }}";
 }
 
 [Flags]

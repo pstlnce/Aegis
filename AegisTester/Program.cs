@@ -27,7 +27,7 @@ source.Rows.Add("Map7", 7, "Description for map 7", DateTime.Now);
 
 DbDataReader reader = source.CreateDataReader();
 
-foreach (var item in MapperParser.ReadList(reader))
+foreach (var item in MapperParser.ReadUnbuffered(reader))
 {
     Console.WriteLine(JsonSerializer.Serialize(item));
 }
@@ -37,13 +37,14 @@ Console.ReadLine();
 return;
 
 [
-    AegisAgent,
-    Some(Map = ["", 1, 3])
+    AegisAgent(Case = MatchCase.IgnoreCase),
+    Some(Map = ["", 1, 3, null!]),
 ]
 public sealed class Mapper
 {
     public static string[] _p;
 
+    [FieldSource(["num"])]
     public int Num1 { get; set; }
 
     public string Name { get; set; }
