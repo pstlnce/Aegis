@@ -80,30 +80,46 @@ internal sealed class AegisGen : IIncrementalGenerator
                 return default;
             }
 
-
-            ImmutableArray<SettableProperty> properties = target.GetMembers()
-                .Where(static member => member is IPropertySymbol)
-                .Select(static member => (IPropertySymbol)member)
-                .Where(static property => !property.IsReadOnly)
-                .Select((property, i) =>
+            ImmutableArray<Settable> settables = target
+                .GetMembers()
+                .Where(static member => member switch
                 {
-                    var fielSourcedAttribute = property.GetAttributes().FirstOrDefault(attribute =>
-                            attribute.AttributeClass?.ContainingNamespace.Name == AegisAttributeGenerator.Namespace
-                            && attribute.AttributeClass.Name == FieldSourceAttrubteGenerator.AttributeName);
+                    IPropertySymbol property
+                        => property.SetMethod is { DeclaredAccessibility: Accessibility.Public or Accessibility.Internal },
 
-                    if(fielSourcedAttribute != null)
+                    IFieldSymbol field
+                        => !field.IsConst
+                        && !field.IsStatic
+                        && !field.IsReadOnly
+                        && field.DeclaredAccessibility is Accessibility.Public or Accessibility.Internal,
+
+                    _ => false
+                })
+                .Select(static (member, i) =>
+                {
+                    var field = member as IFieldSymbol;
+
+                    var (type, attributes, isRequired) = member is IPropertySymbol property
+                        ? (property.Type, property.GetAttributes(), property.IsRequired)
+                        : (field!.Type, field!.GetAttributes(), field!.IsRequired);
+
+                    var sourcedAttribute = attributes.FirstOrDefault(attribute =>
+                        attribute.AttributeClass?.ContainingNamespace.Name == AegisAttributeGenerator.Namespace
+                        && attribute.AttributeClass.Name == FieldSourceAttrubteGenerator.AttributeName
+                    );
+
+                    if (sourcedAttribute != null)
                     {
-                        var a = new FieldSourceAttributeParse(fielSourcedAttribute);
+                        var a = new FieldSourceAttributeParse(sourcedAttribute);
                         a.Debug();
                     }
 
-                    var type = property.Type;
                     var typeNamespace = type.ContainingNamespace;
 
                     var namespaceSnapshot = new NamespaceSnapshot(typeNamespace.Name, typeNamespace.ToDisplayString(), typeNamespace.IsGlobalNamespace);
                     var typeSnapshot = new TypeSnapshot(type.Name, type.ToDisplayString(), type.IsReferenceType, namespaceSnapshot);
 
-                    return new SettableProperty(property.Name, typeSnapshot, i, property.IsRequired);
+                    return new Settable(typeSnapshot, member.Name, isRequired, i);
                 })
                 .ToImmutableArray();
 
@@ -111,8 +127,8 @@ internal sealed class AegisGen : IIncrementalGenerator
 
             var namespaceSnapshot = new NamespaceSnapshot(targetNamespace.Name, targetNamespace.ToDisplayString(), targetNamespace.IsGlobalNamespace);
             var typeSnapshot = new TypeSnapshot(target.Name, target.ToDisplayString(), target.IsReferenceType, namespaceSnapshot);
-
-            var targetModel = new MatchingModel(typeSnapshot, properties, new MatchingSettings(parser.MatchCasePropertyValue == null ? MatchCase.None : (MatchCase)parser.MatchCasePropertyValue));
+             
+            var targetModel = new MatchingModel(typeSnapshot, settables, new MatchingSettings(parser.MatchCasePropertyValue == null ? MatchCase.None : (MatchCase)parser.MatchCasePropertyValue));
 
             return targetModel;
         }
@@ -206,7 +222,7 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static IndentedInterpolatedStringHandler AppendReadUnbuffered(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
-        var properties = model.Properties;
+        var properties = model.Settables;
         var type = model.Type;
 
         return _[
@@ -238,7 +254,7 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static IndentedInterpolatedStringHandler AppendReadList(IndentStackWriter writer, MatchingModel model, CancellationToken token = default)
     {
-        var properties = model.Properties;
+        var properties = model.Settables;
         var type = model.Type;
 
         return writer[
@@ -274,7 +290,7 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static IndentedInterpolatedStringHandler AppendReadListAsync(IndentStackWriter _, MatchingModel model, bool isValueTask, CancellationToken token = default)
     {
-        var properties = model.Properties;
+        var properties = model.Settables;
         var type = model.Type;
 
         return _[
@@ -322,7 +338,7 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static IndentedInterpolatedStringHandler AppendReadUnbufferedAsync(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
-        var properties = model.Properties;
+        var properties = model.Settables;
         var type = model.Type;
 
         return _[
@@ -363,7 +379,7 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static IndentedInterpolatedStringHandler AppendReadSchemaIndexes(IndentStackWriter writer, MatchingModel model, CancellationToken token = default)
     {
-        var properties = model.Properties;
+        var properties = model.Settables;
         var type = model.Type;
 
         return writer[
@@ -383,7 +399,7 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static IndentedInterpolatedStringHandler AppendReadSchemaColumnIndex(IndentStackWriter writer, MatchingModel model, CancellationToken token = default)
     {
-        var properties = model.Properties;
+        var properties = model.Settables;
         var matchCases = model.MatchingSettings.MatchCase;
 
         var namesToMatch = GetNamesToMatch(model, token);
@@ -413,15 +429,15 @@ internal sealed class AegisGen : IIncrementalGenerator
             """];
     }
 
-    internal static new SortedDictionary<int, List<(string name, SettableProperty property)>> GetNamesToMatch(MatchingModel model, CancellationToken token = default)
+    internal static new SortedDictionary<int, List<(string name, Settable property)>> GetNamesToMatch(MatchingModel model, CancellationToken token = default)
     {
         if (token.IsCancellationRequested) return [];
 
-        var properties = model.Properties;
+        var properties = model.Settables;
         var type = model.Type;
         var matchCases = model.MatchingSettings.MatchCase;
 
-        var namesToMatch = new SortedDictionary<int, List<(string name, SettableProperty property)>>();
+        var namesToMatch = new SortedDictionary<int, List<(string name, Settable property)>>();
         var names = new List<string>();
 
         foreach (var property in properties)
@@ -508,19 +524,6 @@ internal sealed class AegisGen : IIncrementalGenerator
 
         return namesToMatch;
     }
-
-    internal static bool TryGetSettableProperty(ISymbol? member, [NotNullWhen(true)] out IPropertySymbol? settableProperty)
-    {
-        if (member is IPropertySymbol property &&
-            property.SetMethod is { IsReadOnly: false })
-        {
-            settableProperty = property;
-            return true;
-        }
-
-        settableProperty = null;
-        return false;
-    }
 }
 
 internal readonly struct AegisAttributeParse(AttributeData source)
@@ -571,41 +574,38 @@ internal readonly struct FieldSourceAttributeParse(AttributeData source)
             var argument = _source.ConstructorArguments[i];
         }
     }
-
-    private TypedConstant? FindNamedArg(string parameter)
-    {
-        for (int i = 0; i != _source.NamedArguments.Length; i++)
-        {
-            var argument = _source.NamedArguments[i];
-
-            if (argument.Key == parameter)
-            {
-                return argument.Value;
-            }
-        }
-
-        return default;
-    }
 }
 
 internal readonly struct MatchingModel
 {
     public readonly TypeSnapshot Type;
-    public readonly ImmutableArray<SettableProperty> Properties;
+    public readonly ImmutableArray<Settable> Settables;
     public readonly MatchingSettings MatchingSettings;
 
-    public MatchingModel(TypeSnapshot type, ImmutableArray<SettableProperty> properties, MatchingSettings matchingSettings)
-        => (Type, Properties, MatchingSettings) = (type, properties, matchingSettings);
+    public MatchingModel(TypeSnapshot type, ImmutableArray<Settable> settables, MatchingSettings matchingSettings)
+        => (Type, Settables, MatchingSettings) = (type, settables, matchingSettings);
 }
 
-internal readonly struct SettableProperty
+internal struct Settable
 {
+    private MatchCase _match = MatchCase.None;
+
     public readonly TypeSnapshot Type;
     public readonly string Name;
     public readonly int DeclarationOrder;
     public readonly bool Required;
 
-    public SettableProperty(string name, TypeSnapshot type, int declarationOrder, bool required)
+    public MatchCase Match
+    {
+        readonly get => _match;
+        set
+        {
+            _match = (MatchCase)Math.Max((int)value, 0);
+            _match = _match == MatchCase.None ? MatchCase.MatchOriginal : _match;
+        }
+    }
+
+    public Settable(TypeSnapshot type, string name, bool required, int declarationOrder)
         => (Name, Type, DeclarationOrder, Required)
         = (name, type, declarationOrder, required);
 }

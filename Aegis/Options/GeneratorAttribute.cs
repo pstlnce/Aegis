@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Text.RegularExpressions;
 using System.Linq;
+using System.Collections.Generic;
 
 namespace Aegis.Options;
 
@@ -66,6 +67,8 @@ internal static class MatchCaseGenerator
     public const string EnumName = nameof(MatchCase);
     public const string Namespace = AegisAttributeGenerator.Namespace;
 
+    public static readonly Regex _snake = new("([a-z])([A-Z])", RegexOptions.Compiled);
+
     public static MatchCase[] CaseSettings = Enum.GetValues(typeof(MatchCase))
         .Cast<MatchCase>()
         .Where(x => x > MatchCase.None && x < MatchCase.All)
@@ -87,8 +90,6 @@ internal static class MatchCaseGenerator
     ])
 )}
     }}";
-
-    public static readonly Regex _snake = new("([a-z])([A-Z])", RegexOptions.Compiled);
 
     public static string ToSnakeCase(string value)
     {
