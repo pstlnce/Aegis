@@ -1,12 +1,15 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
 
 namespace Aegis.IndentWriter;
 
 internal sealed class IndentStackWriter
 {
     private readonly StringBuilder _sourceCode;
+    private readonly CancellationToken _token;
 
     private Memory<char> _indent;
     private Memory<int> _indentSlices;
@@ -15,15 +18,17 @@ internal sealed class IndentStackWriter
 
     private ArraySegment<char> _lastLine = new([]);
 
-    public IndentStackWriter(StringBuilder sourceCode, int indentInitial = 0, char indentSymbol = '\t')
+    public IndentStackWriter(StringBuilder sourceCode, int indentInitial = 0, char indentSymbol = '\t', CancellationToken token = default)
     {
         _sourceCode = sourceCode;
+        _token = token;
         AddIndent(indentInitial, indentSymbol);
     }
 
-    public IndentStackWriter(StringBuilder sourceCode, ReadOnlySpan<char> initialIndent)
+    public IndentStackWriter(StringBuilder sourceCode, ReadOnlySpan<char> initialIndent, CancellationToken token = default)
     {
         _sourceCode = sourceCode;
+        _token = token;
         AddIndent(initialIndent);
     }
 
@@ -36,10 +41,42 @@ internal sealed class IndentStackWriter
     /// <summary> Don't store in variable to reuse </summary>
     public IndentScopeHook Scope => new(this);
 
+    public IfTrueWriter If(bool condition) => new(condition, this);
+
     public IndentedInterpolatedStringHandler this[[InterpolatedStringHandlerArgument("")] IndentedInterpolatedStringHandler value] => value;
+
+    public IndentedInterpolatedStringHandler this[IEnumerable<string> source, string joinBy = "\n\n"]
+    {
+        get
+        {
+            if (_token.IsCancellationRequested) return default;
+
+            using var enumerator = source.GetEnumerator();
+
+            if (!enumerator.MoveNext())
+                return default;
+
+            var current = enumerator.Current;
+
+            var join = joinBy.AsSpan();
+
+            while (true)
+            {
+                AppendLineSplitted(current.AsSpan());
+
+                if (!enumerator.MoveNext())
+                    break;
+
+                AppendLineSplitted(join);
+            }
+
+            return default;
+        }
+    }
 
     public void AppendLineSplitted(ReadOnlySpan<char> source)
     {
+        if (_token.IsCancellationRequested) return;
         if (source.IsEmpty) return;
 
         bool end;
@@ -84,6 +121,7 @@ internal sealed class IndentStackWriter
 
     public void Append(ReadOnlySpan<char> source)
     {
+        if(_token.IsCancellationRequested) return;
         if (source.IsEmpty) return;
 
         AppendIndent();
@@ -92,6 +130,7 @@ internal sealed class IndentStackWriter
 
     public void AddIndent(int times, char symbol)
     {
+        if(_token.IsCancellationRequested) return;
         if (times <= 0) return;
 
         const int partSize = 4;
@@ -120,6 +159,7 @@ internal sealed class IndentStackWriter
 
     public void PopIndent()
     {
+        if(_token.IsCancellationRequested) return;
         if (_slicesCount == 0) return;
 
         _slicesCount -= 1;
@@ -128,6 +168,7 @@ internal sealed class IndentStackWriter
 
     public void AddIndent(ReadOnlySpan<char> indent)
     {
+        if(_token.IsCancellationRequested) return;
         if (indent.IsEmpty) return;
 
         EnsureBufferSizes(indent.Length);

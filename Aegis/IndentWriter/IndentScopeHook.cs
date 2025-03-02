@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Runtime.CompilerServices;
 
 namespace Aegis.IndentWriter;
 
@@ -20,7 +22,11 @@ internal readonly struct IndentScopeHook
         }
     }
 
-    public IndentedInterpolatedStringHandler this[IndentedInterpolatedStringHandler val]
+    public readonly IndentStackWriter Writer => _writer;
+
+    public readonly IfTrueWriter If(bool condition) => new(condition, this);
+
+    public IndentedInterpolatedStringHandler this[[InterpolatedStringHandlerArgument("")] IndentedInterpolatedStringHandler val]
     {
         get
         {
@@ -61,6 +67,37 @@ internal readonly struct IndentScopeHook
             End();
             return string.Empty;
         }
+    }
+
+    public string ForEach<T>(ImmutableArray<T> source, Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> write, string joinBy = "\n\n")
+    {
+        var enumerator = source.GetEnumerator();
+
+        if (!enumerator.MoveNext())
+        {
+            End();
+            return string.Empty;
+        }
+
+        var previous = enumerator.Current;
+        bool end;
+
+        do
+        {
+            write(_writer, previous);
+
+            if (end = !enumerator.MoveNext())
+            {
+                continue;
+            }
+
+            _writer.AppendLineSplitted(joinBy.AsSpan());
+            previous = enumerator.Current;
+
+        } while (!end);
+
+        End();
+        return string.Empty;
     }
 
     public string ForEach<T>(IEnumerable<T> source, Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> write, string joinBy = "\n\n")

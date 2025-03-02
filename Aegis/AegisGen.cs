@@ -17,16 +17,6 @@ using System.Threading;
 
 namespace Aegis;
 
-internal sealed class AegisConverterAttribute : Attribute
-{
-    public Expression<Func<object, object>> Expression { get; private set; }
-
-    public AegisConverterAttribute(Expression<Func<object, object>> expression)
-    {
-        Expression = expression;
-    }
-}
-
 [Generator(LanguageNames.CSharp)]
 internal sealed class AegisGen : IIncrementalGenerator
 {
@@ -80,7 +70,7 @@ internal sealed class AegisGen : IIncrementalGenerator
                 return default;
             }
 
-            ImmutableArray<Settable> settables = target
+            var settables = target
                 .GetMembers()
                 .Where(static member => member switch
                 {
@@ -121,14 +111,21 @@ internal sealed class AegisGen : IIncrementalGenerator
 
                     return new Settable(typeSnapshot, member.Name, isRequired, i);
                 })
-                .ToImmutableArray();
+                .ToArray();
+
+            if(settables.Length == 0)
+                return null;
 
             var targetNamespace = target.ContainingNamespace;
 
             var namespaceSnapshot = new NamespaceSnapshot(targetNamespace.Name, targetNamespace.ToDisplayString(), targetNamespace.IsGlobalNamespace);
             var typeSnapshot = new TypeSnapshot(target.Name, target.ToDisplayString(), target.IsReferenceType, namespaceSnapshot);
              
-            var targetModel = new MatchingModel(typeSnapshot, settables, new MatchingSettings(parser.MatchCasePropertyValue == null ? MatchCase.None : (MatchCase)parser.MatchCasePropertyValue));
+            var targetModel = new MatchingModel(
+                type: typeSnapshot,
+                settables: settables,
+                matchingSettings: new MatchingSettings(parser.MatchCasePropertyValue == null ? MatchCase.None : (MatchCase)parser.MatchCasePropertyValue)
+            );
 
             return targetModel;
         }
@@ -177,7 +174,7 @@ internal sealed class AegisGen : IIncrementalGenerator
                     : _[$$""" 
                         namespace {{typeNamespace}}
                         {
-                            {{_.Scope[AppendClass(_, model.Value, token)]}}
+                            {{_[AppendClass(_, model.Value, token)]}}
                         }
                         """
                     ]
@@ -200,32 +197,32 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static IndentedInterpolatedStringHandler AppendClass(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
-        return _[$$"""
+        return _.Scope[$$"""
             internal sealed partial class {{model.Type.Name}}Parser
             {
-                {{_.Scope[AppendReadList(_, model)]}}
+                {{_[AppendReadList(_, model)]}}
 
-                {{_.Scope[AppendReadUnbuffered(_, model)]}}
+                {{_[AppendReadUnbuffered(_, model)]}}
 
-                {{_.Scope[AppendReadListAsync(_, model, isValueTask: false, token)]}}
+                {{_[AppendReadListAsync(_, model, isValueTask: false, token)]}}
 
-                {{_.Scope[AppendReadListAsync(_, model, isValueTask: true, token)]}}
+                {{_[AppendReadListAsync(_, model, isValueTask: true, token)]}}
 
-                {{_.Scope[AppendReadUnbufferedAsync(_, model)]}}
+                {{_[AppendReadUnbufferedAsync(_, model)]}}
 
-                {{_.Scope[AppendReadSchemaIndexes(_, model)]}}
+                {{_[AppendReadSchemaIndexes(_, model)]}}
 
-                {{_.Scope[AppendReadSchemaColumnIndex(_, model)]}}
+                {{_[AppendReadSchemaColumnIndex(_, model)]}}
             }
             """];
     }
 
     internal static IndentedInterpolatedStringHandler AppendReadUnbuffered(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
-        var properties = model.Settables;
+        var settables = model.Settables;
         var type = model.Type;
 
-        return _[
+        return _.Scope[
             $$"""
             internal static IEnumerable<{{type.Name}}> ReadUnbuffered<TReader>(TReader reader)
                 where TReader : IDataReader
@@ -235,16 +232,11 @@ internal sealed class AegisGen : IIncrementalGenerator
                     yield break;
                 }
 
-                ReadSchemaIndexes(reader{{properties.Select(x => $", out var col{x.Name}")}});
+                ReadSchemaIndexes(reader{{settables.Select(x => $", out var col{x.Name}")}});
             
                 do
                 {
-                    var parsed = new {{type.Name}}();
-            
-                    {{_.Scope.ForEach(properties, (w, x) => x.Type.IsReference
-                        ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"]
-                        : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.DisplayString} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
-                        joinBy: "\n")}}
+                    {{_[AppendParsingBody(_, model, token)]}}
 
                     yield return parsed;
                 } while(reader.Read());
@@ -252,12 +244,12 @@ internal sealed class AegisGen : IIncrementalGenerator
             """];
     }
 
-    internal static IndentedInterpolatedStringHandler AppendReadList(IndentStackWriter writer, MatchingModel model, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendReadList(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
         var properties = model.Settables;
         var type = model.Type;
 
-        return writer[
+        return _.Scope[
             $$"""
             internal static List<{{type.Name}}> ReadList<TReader>(TReader reader)
                 where TReader : IDataReader
@@ -273,12 +265,7 @@ internal sealed class AegisGen : IIncrementalGenerator
             
                 do
                 {
-                    var parsed = new {{type.Name}}();
-            
-                    {{writer.Scope.ForEach(properties, (w, x) => x.Type.IsReference
-                        ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"]
-                        : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.DisplayString} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
-                        joinBy: "\n")}}
+                    {{_[AppendParsingBody(_, model, token)]}}
 
                     result.Add(parsed);
                 } while(reader.Read());
@@ -290,10 +277,10 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static IndentedInterpolatedStringHandler AppendReadListAsync(IndentStackWriter _, MatchingModel model, bool isValueTask, CancellationToken token = default)
     {
-        var properties = model.Settables;
+        var settables = model.Settables;
         var type = model.Type;
 
-        return _[
+        return _.Scope[
             $$"""
             {{_[isValueTask
               ? _[$"internal static async ValueTask<List<{type.Name}>> ReadListAsyncValue<TReader>(TReader reader, CancellationToken token = default)"]
@@ -308,18 +295,13 @@ internal sealed class AegisGen : IIncrementalGenerator
                     return result;
                 }
             
-                ReadSchemaIndexes(reader{{properties.Select(x => $", out var col{x.Name}")}});
+                ReadSchemaIndexes(reader{{settables.Select(x => $", out var col{x.Name}")}});
             
                 Task<bool> reading;
 
                 while(true)
                 {
-                    var parsed = new {{type.Name}}();
-            
-                    {{_.Scope.ForEach(properties, (w, x) => x.Type.IsReference
-                        ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"]
-                        : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.DisplayString} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
-                        joinBy: "\n")}}
+                    {{_[AppendParsingBody(_, model, token)]}}
 
                     reading = reader.ReadAsync(token);
 
@@ -338,10 +320,10 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static IndentedInterpolatedStringHandler AppendReadUnbufferedAsync(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
-        var properties = model.Settables;
+        var settables = model.Settables;
         var type = model.Type;
 
-        return _[
+        return _.Scope[
             $$"""
             internal static async IAsyncEnumerable<{{type.Name}}> ReadUnbufferedAsync<TReader>(TReader reader, [EnumeratorCancellationAttribute] CancellationToken token = default)
                 where TReader : DbDataReader
@@ -351,18 +333,13 @@ internal sealed class AegisGen : IIncrementalGenerator
                     yield break;
                 }
 
-                ReadSchemaIndexes(reader{{properties.Select(x => $", out var col{x.Name}")}});
+                ReadSchemaIndexes(reader{{settables.Select(x => $", out var col{x.Name}")}});
             
                 Task<bool> reading;
 
                 while(true)
                 {
-                    var parsed = new {{type.Name}}();
-            
-                    {{_.Scope.ForEach(properties, (w, x) => x.Type.IsReference
-                        ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"]
-                        : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.DisplayString} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
-                        joinBy: "\n")}}
+                    {{_[AppendParsingBody(_, model, token)]}}
 
                     reading = reader.ReadAsync(token);
 
@@ -377,42 +354,78 @@ internal sealed class AegisGen : IIncrementalGenerator
             """];
     }
 
-    internal static IndentedInterpolatedStringHandler AppendReadSchemaIndexes(IndentStackWriter writer, MatchingModel model, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendReadSchemaIndexes(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
-        var properties = model.Settables;
+        var settables = model.Settables;
+        var required = model.RequiredSettables;
+
         var type = model.Type;
 
-        return writer[
+        return _.Scope[
             $$"""
-            internal static void ReadSchemaIndexes<TReader>(TReader reader{{properties.Select(x => $", out int column{x.Name}")}})
+            {{_.If(required.Length != 0)[
+            $$"""
+            internal static void ThrowIfNotEnoughFieldsForRequiredException(int expected, int actual)
+            {
+                if(expected > actual)
+                    throw new {{NotEnoughReaderFieldsException.FullName}}(expected, actual);
+            }
+
+            internal static void ThrowNoFieldSourceMatchedRequiredSettableException(string[] settables)
+            {
+                throw new {{MissingRequiredFieldOrPropertyException.FullName}}(settables);
+            }
+            """
+            ]}}
+
+            internal static void ReadSchemaIndexes<TReader>(TReader reader{{settables.Select(x => $", out int column{x.Name}")}})
                 where TReader : IDataReader
             {
-                {{writer.Scope[properties.Select(x => $"column{x.Name} = -1;"), joinBy: "\n"]}}
+                {{_.If(required.Length != 0)[$"ThrowIfNotEnoughFieldsForRequiredException({required.Length}, reader.FieldCount);"]}}
+
+                {{_.Scope[settables.Select(x => $"column{x.Name} = -1;"), joinBy: "\n"]}}
 
                 for(int i = 0; i != reader.FieldCount; i++)
                 {
-                    ReadSchemaColumnIndex(reader.GetName(i), i{{properties.Select(x => $", ref column{x.Name}")}});
+                    ReadSchemaColumnIndex(reader.GetName(i), i{{settables.Select(x => $", ref column{x.Name}")}});
                 }
+
+                {{_.Scope.If(required.Length != 0)[
+                $$"""
+                int missedCount =
+                    {{_.Scope[required.Select(x => $"column{x.Name} == -1 ? 1 : 0"), joinBy: "+\n"]}};
+
+                if(missedCount > 0)
+                {
+                    string[] missed = new string[missedCount];
+                    int writed = 0;
+
+                    {{_.Scope[required.Select(x => $"if(column{x.Name} == -1) missed[writed++] = \"{x.Name}\";"), joinBy: "\n"]}}
+
+                    ThrowNoFieldSourceMatchedRequiredSettableException(missed);
+                }
+                """
+                ]}}
             }
             """];
     }
 
-    internal static IndentedInterpolatedStringHandler AppendReadSchemaColumnIndex(IndentStackWriter writer, MatchingModel model, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendReadSchemaColumnIndex(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
         var properties = model.Settables;
         var matchCases = model.MatchingSettings.MatchCase;
 
         var namesToMatch = GetNamesToMatch(model, token);
 
-        return writer[
+        return _.Scope[
             $$"""
             internal static void ReadSchemaColumnIndex(string c, int i{{properties.Select(x => $", ref int col{x.Name}")}})
             {
                 switch(c.Length)
                 {
-                    {{writer.Scope.ForEach(namesToMatch, (_, n) => _[$$"""
+                    {{_.Scope.ForEach(namesToMatch, (_, n) => _[$$"""
                     case {{n.Key}}:
-                        {{writer.Scope.ForEach(n.Value, (_, x) => _[$$"""
+                        {{_.Scope.ForEach(n.Value, (_, x) => _[$$"""
                             {{(matchCases.HasFlag(MatchCase.IgnoreCase)
                         ? $"if(col{x.property.Name} == -1 && string.Equals(c, \"{x.name}\", StringComparison.OrdinalIgnoreCase))"
                         : $"if(col{x.property.Name} == -1 && c == \"{x.name}\")")}}
@@ -429,7 +442,34 @@ internal sealed class AegisGen : IIncrementalGenerator
             """];
     }
 
-    internal static new SortedDictionary<int, List<(string name, Settable property)>> GetNamesToMatch(MatchingModel model, CancellationToken token = default)
+    internal static IndentedInterpolatedStringHandler AppendParsingBody(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
+    {
+        var required = model.RequiredSettables;
+        var optional = model.UsualSettables;
+
+        return _.Scope[
+            $$"""
+            {{_[required.Length == 0
+                ? _[$"var parsed = new {model.Type.Name}();"]
+                : _[$$"""
+                    {{_[required.Select(x => $"{x.Type.DisplayString} val{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"), joinBy: "\n"]}}
+
+                    var parsed = new {{model.Type.Name}}()
+                    {
+                        {{_.Scope.ForEach(required, (_, x) => _[$"{x.Name} = val{x.Name}"], joinBy: ",\n")}}
+                    }; 
+                    """]
+            ]}}
+            
+            {{_.Scope.ForEach(optional, (w, x) => x.Type.IsReference
+                ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"]
+                : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.DisplayString} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
+                joinBy: "\n")}}
+            """
+        ];
+    }
+
+    internal static SortedDictionary<int, List<(string name, Settable property)>> GetNamesToMatch(MatchingModel model, CancellationToken token = default)
     {
         if (token.IsCancellationRequested) return [];
 
@@ -572,18 +612,63 @@ internal readonly struct FieldSourceAttributeParse(AttributeData source)
         for (int i = 0; i != _source.ConstructorArguments.Length; i++)
         {
             var argument = _source.ConstructorArguments[i];
+
+            var type = argument.Type?.ToDisplayString();
+
+            if(argument.Values.Length > 0)
+            {
+
+            }
+
+            if (argument.Value is int rer)
+            {
+
+            }
+
+            if(type == "string[]")
+            {
+
+            }
+            else if(type == "int")
+            {
+
+            }
         }
     }
 }
 
 internal readonly struct MatchingModel
 {
-    public readonly TypeSnapshot Type;
+    public readonly ImmutableArray<Settable> RequiredSettables;
+    public readonly ImmutableArray<Settable> UsualSettables;
     public readonly ImmutableArray<Settable> Settables;
+
+    public readonly TypeSnapshot Type;
     public readonly MatchingSettings MatchingSettings;
 
-    public MatchingModel(TypeSnapshot type, ImmutableArray<Settable> settables, MatchingSettings matchingSettings)
-        => (Type, Settables, MatchingSettings) = (type, settables, matchingSettings);
+    public MatchingModel(TypeSnapshot type, Settable[] settables, MatchingSettings matchingSettings)
+    {
+        Type = type;
+        MatchingSettings = matchingSettings;
+
+        Array.Sort(settables, _comparer);
+
+        var requiredCount = settables.TakeWhile(x => x.Required).Count();
+
+        var requiredSettables = ImmutableArray.Create(settables.AsSpan(0, requiredCount));
+        var otherSettables = ImmutableArray.Create(settables.AsSpan(requiredCount));
+
+        Settables = ImmutableArray.Create(settables);
+        RequiredSettables = requiredSettables;
+        UsualSettables = otherSettables;
+    }
+
+    private static readonly IComparer<Settable> _comparer = Comparer<Settable>.Create(static (x, y) => (x, y) switch
+    {
+        ({ Required: true }, { Required: false }) => -1,
+        ({ Required: false }, { Required: true }) => 1,
+        _ => y.DeclarationOrder - x.DeclarationOrder
+    });
 }
 
 internal struct Settable

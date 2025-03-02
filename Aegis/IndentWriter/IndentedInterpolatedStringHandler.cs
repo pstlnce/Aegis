@@ -14,6 +14,16 @@ internal readonly struct IndentedInterpolatedStringHandler
         _writer = writer;
     }
 
+    public IndentedInterpolatedStringHandler(int literalLength, int formattedCount, IndentScopeHook hooked)
+    {
+        _writer = hooked.Writer;
+    }
+
+    public IndentedInterpolatedStringHandler(int literalLength, int formattedCount, IfTrueWriter conditional)
+    {
+        _writer = conditional.Writer;
+    }
+
     public readonly void AppendLiteral(string literal)
         => AppendLiteral(literal.AsSpan());
 
@@ -62,4 +72,6 @@ internal readonly struct IndentedInterpolatedStringHandler
     {
         return string.Empty;
     }
+
+    public static implicit operator string(IndentedInterpolatedStringHandler handler) => handler.ToString();
 }

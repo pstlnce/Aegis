@@ -31,6 +31,10 @@ namespace {Namespace}
     {FieldSourceAttrubteGenerator.SourceCode}
 
     {MatchCaseGenerator.MatchCaseEnum}
+
+    {NotEnoughReaderFieldsException.Source}
+
+    {MissingRequiredFieldOrPropertyException.Source}
 }}";
 }
 
@@ -42,10 +46,8 @@ internal sealed class FieldSourceAttrubteGenerator
 $@"[AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
     internal sealed class {AttributeName} : Attribute
     {{
-        public {AttributeName}(string singleField) {{}}
-        public {AttributeName}(string[] multipleField) {{}}
+        public {AttributeName}(params string[] fields) {{}}
         public {AttributeName}(int fieldOrder) {{}}
-        public {AttributeName}(object[] fieldOrderOrName) {{}}
     }}";
 }
 

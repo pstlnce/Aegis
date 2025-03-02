@@ -44,7 +44,7 @@ public sealed class Mapper
 {
     public static string[] _p;
 
-    [FieldSource(["num"])]
+    [FieldSource("num")]
     public int Num1 { get; set; }
 
     public string Name { get; set; }
