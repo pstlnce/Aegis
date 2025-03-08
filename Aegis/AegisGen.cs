@@ -9,9 +9,6 @@ using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Reflection.Metadata;
-using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 
@@ -59,6 +56,7 @@ internal sealed class AegisGen : IIncrementalGenerator
         static MatchingModel? transform(GeneratorAttributeSyntaxContext gen, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
+
             var src = AegisAttributeGenerator.MarkerAttributeSourceCode;
             var attributeInstance = gen.Attributes[0];
 
@@ -98,10 +96,18 @@ internal sealed class AegisGen : IIncrementalGenerator
                         && attribute.AttributeClass.Name == FieldSourceAttrubteGenerator.AttributeName
                     );
 
-                    if (sourcedAttribute != null)
+                    var fieldSource = sourcedAttribute.ParseToFieldSource();
+
+#if DEBUG
+                    if(fieldSource?.IsOrder == true)
                     {
-                        var a = new FieldSourceAttributeParse(sourcedAttribute);
-                        a.Debug();
+
+                    }
+#endif
+
+                    if(fieldSource?.TryGetOrder(out var order) == true && order < 0)
+                    {
+                        fieldSource = default;
                     }
 
                     var typeNamespace = type.ContainingNamespace;
@@ -109,7 +115,7 @@ internal sealed class AegisGen : IIncrementalGenerator
                     var namespaceSnapshot = new NamespaceSnapshot(typeNamespace.Name, typeNamespace.ToDisplayString(), typeNamespace.IsGlobalNamespace);
                     var typeSnapshot = new TypeSnapshot(type.Name, type.ToDisplayString(), type.IsReferenceType, namespaceSnapshot);
 
-                    return new Settable(typeSnapshot, member.Name, isRequired, i);
+                    return new Settable(typeSnapshot, member.Name, fieldSource ?? new([member.Name]), isRequired, i);
                 })
                 .ToArray();
 
@@ -361,6 +367,13 @@ internal sealed class AegisGen : IIncrementalGenerator
 
         var type = model.Type;
 
+        var alreadySettedIndexes = settables
+            .Where(x => x.FieldSource.IsOrder)
+            .Select(x => x.FieldSource.Order)
+            .ToList();
+
+        var indexesRangeExcludeZero = Enumerable.Range(1, Math.Max(0, alreadySettedIndexes.Count - 1));
+
         return _.Scope[
             $$"""
             {{_.If(required.Length != 0)[
@@ -383,10 +396,26 @@ internal sealed class AegisGen : IIncrementalGenerator
             {
                 {{_.If(required.Length != 0)[$"ThrowIfNotEnoughFieldsForRequiredException({required.Length}, reader.FieldCount);"]}}
 
-                {{_.Scope[settables.Select(x => $"column{x.Name} = -1;"), joinBy: "\n"]}}
+                {{_.Scope[settables.Select(x => x.FieldSource.IsOrder
+                    ? $"column{x.Name} = {x.FieldSource.Order};"
+                    : $"column{x.Name} = -1;"), joinBy: "\n"]}}
 
                 for(int i = 0; i != reader.FieldCount; i++)
                 {
+                    {{_[alreadySettedIndexes.Count == 0
+                    ? _[default]
+                    : _.Scope[_.If(alreadySettedIndexes.Count > 0)[
+                    $$"""
+                    if (i == {{alreadySettedIndexes[0]}}{{new string('\n', alreadySettedIndexes.Count > 1 ? 1 : 0)}} {{
+                        _.Scope[
+                            indexesRangeExcludeZero.Select(x => $"\t|| i == {alreadySettedIndexes[x]}"),
+                            joinBy: "\n"
+                        ]}})
+                    {
+                        continue;
+                    }
+                    """
+                    ]]]}}
                     ReadSchemaColumnIndex(reader.GetName(i), i{{settables.Select(x => $", ref column{x.Name}")}});
                 }
 
@@ -473,85 +502,93 @@ internal sealed class AegisGen : IIncrementalGenerator
     {
         if (token.IsCancellationRequested) return [];
 
-        var properties = model.Settables;
+        var settables = model.Settables;
         var type = model.Type;
         var matchCases = model.MatchingSettings.MatchCase;
 
         var namesToMatch = new SortedDictionary<int, List<(string name, Settable property)>>();
         var names = new List<string>();
 
-        foreach (var property in properties)
+        foreach (var settable in settables)
         {
             if (token.IsCancellationRequested) return [];
 
-            if (matchCases.HasFlag(MatchCase.IgnoreCase))
+            if(!settable.FieldSource.TryGetFields(out var fieldSources))
             {
-                var lowerCase =
-                    matchCases.HasFlag(MatchCase.MatchOriginal) ||
-                    matchCases.HasFlag(MatchCase.CamalCase) ||
-                    matchCases.HasFlag(MatchCase.PascalCase)
-                    ? property.Name.ToLower()
-                    : null;
-
-                if (lowerCase != null)
-                {
-                    if (!namesToMatch.TryGetValue(lowerCase.Length, out var sameLength))
-                    {
-                        namesToMatch[lowerCase.Length] = sameLength = [];
-                    }
-
-                    sameLength.Add((lowerCase, property));
-                }
-
-                var snake = matchCases.HasFlag(MatchCase.SnakeCase)
-                    ? MatchCaseGenerator.ToSnakeCase(property.Name)
-                    : null;
-
-                if (snake != null && snake != lowerCase)
-                {
-                    if (!namesToMatch.TryGetValue(snake.Length, out var sameLength))
-                    {
-                        namesToMatch[snake.Length] = sameLength = [];
-                    }
-
-                    sameLength.Add((snake, property));
-                }
-
                 continue;
             }
 
-            if (matchCases.HasFlag(MatchCase.MatchOriginal))
+            foreach (var fieldSoruce in fieldSources)
             {
-                var original = property.Name;
-                names.Add(original);
-            }
-
-            if (matchCases.HasFlag(MatchCase.SnakeCase))
-            {
-                var snake = MatchCaseGenerator.ToSnakeCase(property.Name);
-                if (!names.Contains(snake)) names.Add(snake);
-            }
-
-            if (matchCases.HasFlag(MatchCase.CamalCase))
-            {
-                var camel = MatchCaseGenerator.ToCamelCase(property.Name);
-                if (!names.Contains(camel)) names.Add(camel);
-            }
-
-            if (matchCases.HasFlag(MatchCase.PascalCase))
-            {
-                var pascal = MatchCaseGenerator.ToPascalCase(property.Name);
-                if (!names.Contains(pascal)) names.Add(pascal);
-            }
-
-            foreach (var nameCase in names)
-            {
-                if (!namesToMatch.TryGetValue(nameCase.Length, out var sameLength))
+                if (matchCases.HasFlag(MatchCase.IgnoreCase))
                 {
-                    namesToMatch[nameCase.Length] = sameLength = [];
+                    var lowerCase =
+                        matchCases.HasFlag(MatchCase.MatchOriginal) ||
+                        matchCases.HasFlag(MatchCase.CamalCase) ||
+                        matchCases.HasFlag(MatchCase.PascalCase)
+                        ? fieldSoruce.ToLower()
+                        : null;
+
+                    if (lowerCase != null)
+                    {
+                        if (!namesToMatch.TryGetValue(lowerCase.Length, out var sameLength))
+                        {
+                            namesToMatch[lowerCase.Length] = sameLength = [];
+                        }
+
+                        sameLength.Add((lowerCase, settable));
+                    }
+
+                    var snake = matchCases.HasFlag(MatchCase.SnakeCase)
+                        ? MatchCaseGenerator.ToSnakeCase(fieldSoruce)
+                        : null;
+
+                    if (snake != null && snake != lowerCase)
+                    {
+                        if (!namesToMatch.TryGetValue(snake.Length, out var sameLength))
+                        {
+                            namesToMatch[snake.Length] = sameLength = [];
+                        }
+
+                        sameLength.Add((snake, settable));
+                    }
+
+                    continue;
                 }
 
-                sameLength.Add((nameCase, property));
+                if (matchCases.HasFlag(MatchCase.MatchOriginal))
+                {
+                    var original = fieldSoruce;
+                    names.Add(original);
+                }
+
+                if (matchCases.HasFlag(MatchCase.SnakeCase))
+                {
+                    var snake = MatchCaseGenerator.ToSnakeCase(fieldSoruce);
+                    if (!names.Contains(snake)) names.Add(snake);
+                }
+
+                if (matchCases.HasFlag(MatchCase.CamalCase))
+                {
+                    var camel = MatchCaseGenerator.ToCamelCase(fieldSoruce);
+                    if (!names.Contains(camel)) names.Add(camel);
+                }
+
+                if (matchCases.HasFlag(MatchCase.PascalCase))
+                {
+                    var pascal = MatchCaseGenerator.ToPascalCase(fieldSoruce);
+                    if (!names.Contains(pascal)) names.Add(pascal);
+                }
+
+                foreach (var nameCase in names)
+                {
+                    if (!namesToMatch.TryGetValue(nameCase.Length, out var sameLength))
+                    {
+                        namesToMatch[nameCase.Length] = sameLength = [];
+                    }
+
+                    sameLength.Add((nameCase, settable));
+                }
             }
 
             names.Clear();
@@ -603,37 +640,35 @@ internal readonly struct AegisAttributeParse(AttributeData source)
     }
 }
 
-internal readonly struct FieldSourceAttributeParse(AttributeData source)
+internal static class FieldSourceAttributeParse
 {
-    private readonly AttributeData _source = source;
-
-    public void Debug()
+    public static FieldsOrOrder? ParseToFieldSource(this AttributeData? source)
     {
-        for (int i = 0; i != _source.ConstructorArguments.Length; i++)
+        if(source is null)
         {
-            var argument = _source.ConstructorArguments[i];
-
-            var type = argument.Type?.ToDisplayString();
-
-            if(argument.Values.Length > 0)
-            {
-
-            }
-
-            if (argument.Value is int rer)
-            {
-
-            }
-
-            if(type == "string[]")
-            {
-
-            }
-            else if(type == "int")
-            {
-
-            }
+            return default;
         }
+
+        var arguments = source.ConstructorArguments;
+
+        if (arguments.Length != 1)
+            return default;
+
+        var argument = source.ConstructorArguments[0];
+
+        var type = argument.Type?.ToDisplayString();
+
+        return type switch
+        {
+            "int" when argument.Value is int fieldOrder => new(fieldOrder),
+            
+            "string[]" when argument.Values
+                .Where(x => !x.IsNull)
+                .Select(x => (string)x.Value!)
+                .ToList() is { Count: > 0 } fields => new(fields),
+
+            _ => default
+        };
     }
 }
 
@@ -663,7 +698,7 @@ internal readonly struct MatchingModel
         UsualSettables = otherSettables;
     }
 
-    private static readonly IComparer<Settable> _comparer = Comparer<Settable>.Create(static (x, y) => (x, y) switch
+    private static readonly Comparer<Settable> _comparer = Comparer<Settable>.Create(static (x, y) => (x, y) switch
     {
         ({ Required: true }, { Required: false }) => -1,
         ({ Required: false }, { Required: true }) => 1,
@@ -673,26 +708,15 @@ internal readonly struct MatchingModel
 
 internal struct Settable
 {
-    private MatchCase _match = MatchCase.None;
-
     public readonly TypeSnapshot Type;
+    public readonly FieldsOrOrder FieldSource;
     public readonly string Name;
     public readonly int DeclarationOrder;
     public readonly bool Required;
 
-    public MatchCase Match
-    {
-        readonly get => _match;
-        set
-        {
-            _match = (MatchCase)Math.Max((int)value, 0);
-            _match = _match == MatchCase.None ? MatchCase.MatchOriginal : _match;
-        }
-    }
-
-    public Settable(TypeSnapshot type, string name, bool required, int declarationOrder)
-        => (Name, Type, DeclarationOrder, Required)
-        = (name, type, declarationOrder, required);
+    public Settable(TypeSnapshot type, string name, FieldsOrOrder fieldSource, bool required, int declarationOrder)
+        => (Name, Type, FieldSource, DeclarationOrder, Required)
+        = (name, type, fieldSource, declarationOrder, required);
 }
 
 internal readonly struct TypeSnapshot
@@ -728,4 +752,81 @@ internal readonly struct MatchingSettings
 
     public MatchingSettings(MatchCase matchCase)
         => (MatchCase) = (matchCase);
+}
+
+internal readonly struct FieldsOrOrder
+{
+    private const int FIELDS = 1;
+    private const int ORDER = 2;
+
+    private readonly IEnumerable<string> _fields = default!;
+    private readonly int _order;
+    private readonly int _state;
+
+    public FieldsOrOrder(IEnumerable<string> fields)
+    {
+        _fields = fields;
+        _state = FIELDS;
+    }
+
+    public FieldsOrOrder(int order)
+    {
+        _order = order;
+        _state = ORDER;
+    }
+
+    public bool IsFields => _state == FIELDS;
+    public bool IsOrder => _state == ORDER;
+
+    public IEnumerable<string> Fields => _state switch
+    {
+        FIELDS => _fields,
+        _ => throw new StateMismatchinException(FIELDS, _state)
+    };
+
+    public int Order => _state switch
+    {
+        ORDER => _order,
+        _ => throw new StateMismatchinException(ORDER, _state)
+    };
+
+    public bool TryGetFields([NotNullWhen(true)] out IEnumerable<string> fiels)
+    {
+        var (match, result) = _state switch
+        {
+            FIELDS => (true, _fields),
+            ORDER => (false, null!),
+            _ => throw new Exception($"Invalid state: {_state}, allowed only: {Order} or {Fields}"),
+        };
+
+        fiels = result;
+
+        return match;
+    }
+
+    public bool TryGetOrder([NotNullWhen(true)] out int order)
+    {
+        var (match, result) = _state switch
+        {
+            FIELDS => (false, default),
+            ORDER => (true, _order),
+            _ => throw new Exception($"Invalid state: {_state}, allowed only: {Order} or {Fields}"),
+        };
+
+        order = result;
+
+        return match;
+    }
+
+    public static implicit operator FieldsOrOrder(string[] fields) => new(fields);
+    public static implicit operator FieldsOrOrder(List<string> fields) => new(fields);
+    public static implicit operator FieldsOrOrder(ImmutableArray<string> fields) => new(fields);
+
+    public static implicit operator FieldsOrOrder(int order) => new(order);
+}
+
+[Serializable]
+public class StateMismatchinException(int expected, int actual)
+    : Exception($"The union state expected to be {expected} but in fact {actual}")
+{
 }
