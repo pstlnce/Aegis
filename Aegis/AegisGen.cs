@@ -388,14 +388,16 @@ internal sealed class AegisGen : IIncrementalGenerator
             {
                 throw new {{MissingRequiredFieldOrPropertyException.FullName}}(settables);
             }
-            """
-            ]}}
 
+            """]
+            
+            }}
             internal static void ReadSchemaIndexes<TReader>(TReader reader{{settables.Select(x => $", out int column{x.Name}")}})
                 where TReader : IDataReader
             {
-                {{_.If(required.Length != 0)[$"ThrowIfNotEnoughFieldsForRequiredException({required.Length}, reader.FieldCount);"]}}
-
+                {{_.If(required.Length != 0)[$"ThrowIfNotEnoughFieldsForRequiredException({required.Length}, reader.FieldCount);\n"]
+                
+                }}
                 {{_.Scope[settables.Select(x => x.FieldSource.IsOrder
                     ? $"column{x.Name} = {x.FieldSource.Order};"
                     : $"column{x.Name} = -1;"), joinBy: "\n"]}}
@@ -414,13 +416,15 @@ internal sealed class AegisGen : IIncrementalGenerator
                     {
                         continue;
                     }
-                    """
-                    ]]]}}
-                    ReadSchemaColumnIndex(reader.GetName(i), i{{settables.Select(x => $", ref column{x.Name}")}});
-                }
 
+                    """]]]
+
+                    }}
+                    {{_.Scope[$"ReadSchemaColumnIndex(reader.GetName(i), i{settables.Select(x => $", ref column{x.Name}")})"]}};
+                }
                 {{_.Scope.If(required.Length != 0)[
                 $$"""
+
                 int missedCount =
                     {{_.Scope[required.Select(x => $"column{x.Name} == -1 ? 1 : 0"), joinBy: "+\n"]}};
 
@@ -433,6 +437,7 @@ internal sealed class AegisGen : IIncrementalGenerator
 
                     ThrowNoFieldSourceMatchedRequiredSettableException(missed);
                 }
+
                 """
                 ]}}
             }
