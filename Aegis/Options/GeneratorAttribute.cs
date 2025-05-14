@@ -35,6 +35,8 @@ namespace {Namespace}
     {NotEnoughReaderFieldsException.Source}
 
     {MissingRequiredFieldOrPropertyException.Source}
+
+    {CustomParserAttribute.Source}
 }}";
 }
 
@@ -92,6 +94,41 @@ internal static class MatchCaseGenerator
     ])
 )}
     }}";
+
+    public static IEnumerable<string> ToAllCasesForCompare(this MatchCase cases, string value)
+    {
+        if (cases.Has(MatchCase.IgnoreCase))
+        {
+            if (cases.Has(MatchCase.PascalCase, MatchCase.CamalCase, MatchCase.MatchOriginal))
+            {
+                yield return value.ToLower();
+            }
+
+            yield break;
+        }
+
+        if (cases.Has(MatchCase.MatchOriginal))
+            yield return value;
+
+        if (cases.Has(MatchCase.SnakeCase))
+            yield return ToSnakeCase(value);
+
+        if (cases.Has(MatchCase.PascalCase))
+            yield return ToPascalCase(value);
+
+        if (cases.Has(MatchCase.CamalCase))
+            yield return ToCamelCase(value);
+    }
+
+    public static bool Has(this MatchCase cases, MatchCase flag)
+        => (cases & flag) == flag;
+
+    public static bool Has(this MatchCase cases, MatchCase flag1, MatchCase flag2)
+        => cases.Has(flag1 | flag2);
+
+    public static bool Has(this MatchCase cases, MatchCase flag1, MatchCase flag2, MatchCase flag3)
+        => cases.Has(flag1 | flag2 | flag3);
+
 
     public static string ToSnakeCase(string value)
     {

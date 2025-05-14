@@ -35,7 +35,18 @@ internal readonly struct IndentScopeHook
         }
     }
 
-    public string this[IEnumerable<string> repeatable, string joinBy = "\n\n"]
+    public IndentedInterpolatedStringHandler this[string val]
+    {
+        get
+        {
+            _writer.AppendLineSplitted(val.AsSpan());
+
+            End();
+            return default;
+        }
+    }
+
+    public IndentedInterpolatedStringHandler this[IEnumerable<string> repeatable, string joinBy = "\n\n"]
     {
         get
         {
@@ -44,7 +55,7 @@ internal readonly struct IndentScopeHook
             if (!enumerator.MoveNext())
             {
                 End();
-                return string.Empty;
+                return default;
             }
 
             var previous = enumerator.Current;
@@ -65,7 +76,7 @@ internal readonly struct IndentScopeHook
             } while (!end);
 
             End();
-            return string.Empty;
+            return default;
         }
     }
 

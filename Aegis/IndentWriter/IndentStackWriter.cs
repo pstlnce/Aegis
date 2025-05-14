@@ -45,6 +45,15 @@ internal sealed class IndentStackWriter
 
     public IndentedInterpolatedStringHandler this[[InterpolatedStringHandlerArgument("")] IndentedInterpolatedStringHandler value] => value;
 
+    public IndentedInterpolatedStringHandler this[string value]
+    {
+        get
+        {
+            AppendLineSplitted(value.AsSpan());
+            return default;
+        }
+    }
+
     public IndentedInterpolatedStringHandler this[IEnumerable<string> source, string joinBy = "\n\n"]
     {
         get
@@ -56,13 +65,11 @@ internal sealed class IndentStackWriter
             if (!enumerator.MoveNext())
                 return default;
 
-            var current = enumerator.Current;
-
             var join = joinBy.AsSpan();
 
             while (true)
             {
-                AppendLineSplitted(current.AsSpan());
+                AppendLineSplitted(enumerator.Current.AsSpan());
 
                 if (!enumerator.MoveNext())
                     break;
@@ -73,6 +80,8 @@ internal sealed class IndentStackWriter
             return default;
         }
     }
+
+    public void Append(string value) => AppendLineSplitted(value.AsSpan());
 
     public void AppendLineSplitted(ReadOnlySpan<char> source)
     {

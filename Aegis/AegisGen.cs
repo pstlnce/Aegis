@@ -1,8 +1,6 @@
 ﻿using Aegis.IndentWriter;
 using Aegis.Options;
 using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -29,115 +27,23 @@ internal sealed class AegisGen : IIncrementalGenerator
                 postInitContext.AddSource($"{AegisAttributeGenerator.AttributeFullName}.g.cs", AegisAttributeGenerator.MarkerAttributeSourceCode);
         });
 
-        var dbParseTargets = context.SyntaxProvider.ForAttributeWithMetadataName(
-            fullyQualifiedMetadataName: AegisAttributeGenerator.AttributeFullName,
-            predicate: predicate,
-            transform: transform
-        );
+        var customParsers = context.SyntaxProvider.ForCustomParsers();
 
+        var dbParseTargets = context.SyntaxProvider.ForParseTargets();
+
+        var customParsersCollected = customParsers.Collect();
         var dbParseCollected = dbParseTargets.Collect();
 
-        context.RegisterSourceOutput(dbParseCollected, GenerateDataReaderParsers);
+        var collectionEpilogue = customParsersCollected.Combine(dbParseCollected);
 
-        static bool predicate(SyntaxNode syntaxNode, CancellationToken token)
+        context.RegisterSourceOutput(collectionEpilogue, (context, items) =>
         {
-            token.ThrowIfCancellationRequested();
-
-            return syntaxNode switch
-            {
-                StructDeclarationSyntax structDeclare => true,
-                ClassDeclarationSyntax classDecl =>
-                    !classDecl.Modifiers.Any(SyntaxKind.AbstractKeyword) &&
-                    !classDecl.Modifiers.Any(SyntaxKind.StaticKeyword),
-                _ => false,
-            };
-        }
-
-        static MatchingModel? transform(GeneratorAttributeSyntaxContext gen, CancellationToken token)
-        {
-            token.ThrowIfCancellationRequested();
-
-            var src = AegisAttributeGenerator.MarkerAttributeSourceCode;
-            var attributeInstance = gen.Attributes[0];
-
-            var parser = new AegisAttributeParse(attributeInstance);
-            var symbol = gen.TargetSymbol as INamedTypeSymbol;
-
-            if(gen.TargetSymbol is not INamedTypeSymbol target)
-            {
-                return default;
-            }
-
-            var settables = target
-                .GetMembers()
-                .Where(static member => member switch
-                {
-                    IPropertySymbol property
-                        => property.SetMethod is { DeclaredAccessibility: Accessibility.Public or Accessibility.Internal },
-
-                    IFieldSymbol field
-                        => !field.IsConst
-                        && !field.IsStatic
-                        && !field.IsReadOnly
-                        && field.DeclaredAccessibility is Accessibility.Public or Accessibility.Internal,
-
-                    _ => false
-                })
-                .Select(static (member, i) =>
-                {
-                    var field = member as IFieldSymbol;
-
-                    var (type, attributes, isRequired) = member is IPropertySymbol property
-                        ? (property.Type, property.GetAttributes(), property.IsRequired)
-                        : (field!.Type, field!.GetAttributes(), field!.IsRequired);
-
-                    var sourcedAttribute = attributes.FirstOrDefault(attribute =>
-                        attribute.AttributeClass?.ContainingNamespace.Name == AegisAttributeGenerator.Namespace
-                        && attribute.AttributeClass.Name == FieldSourceAttrubteGenerator.AttributeName
-                    );
-
-                    var fieldSource = sourcedAttribute.ParseToFieldSource();
-
-#if DEBUG
-                    if(fieldSource?.IsOrder == true)
-                    {
-
-                    }
-#endif
-
-                    if(fieldSource?.TryGetOrder(out var order) == true && order < 0)
-                    {
-                        fieldSource = default;
-                    }
-
-                    var typeNamespace = type.ContainingNamespace;
-
-                    var namespaceSnapshot = new NamespaceSnapshot(typeNamespace.Name, typeNamespace.ToDisplayString(), typeNamespace.IsGlobalNamespace);
-                    var typeSnapshot = new TypeSnapshot(type.Name, type.ToDisplayString(), type.IsReferenceType, namespaceSnapshot);
-
-                    return new Settable(typeSnapshot, member.Name, fieldSource ?? new([member.Name]), isRequired, i);
-                })
-                .ToArray();
-
-            if(settables.Length == 0)
-                return null;
-
-            var targetNamespace = target.ContainingNamespace;
-
-            var namespaceSnapshot = new NamespaceSnapshot(targetNamespace.Name, targetNamespace.ToDisplayString(), targetNamespace.IsGlobalNamespace);
-            var typeSnapshot = new TypeSnapshot(target.Name, target.ToDisplayString(), target.IsReferenceType, namespaceSnapshot);
-             
-            var targetModel = new MatchingModel(
-                type: typeSnapshot,
-                settables: settables,
-                matchingSettings: new MatchingSettings(parser.MatchCasePropertyValue == null ? MatchCase.None : (MatchCase)parser.MatchCasePropertyValue)
-            );
-
-            return targetModel;
-        }
+            var parsers = items.Left.ToParsers(context);
+            GenerateDataReaderParsers(context, items.Right, parsers);
+        });
     }
 
-    private static void GenerateDataReaderParsers(SourceProductionContext productionContext, ImmutableArray<MatchingModel?> models)
+    private static void GenerateDataReaderParsers(SourceProductionContext productionContext, ImmutableArray<MatchingModel?> models, Dictionary<string, string> parsers)
     {
         var token = productionContext.CancellationToken;
 
@@ -163,6 +69,9 @@ internal sealed class AegisGen : IIncrementalGenerator
             var _ = new IndentStackWriter(sourceCode);
             
             var typeNamespace = !type.Namespace.IsGlobal ? type.Namespace.DisplayString : null;
+            
+            try
+            {
 
             var ignore = _[$$"""
                 using System;
@@ -187,6 +96,12 @@ internal sealed class AegisGen : IIncrementalGenerator
                 ]}}
                 """
             ];
+            }
+            catch (Exception ex)
+            {
+
+                throw;
+            }
 
             if (token.IsCancellationRequested) return;
 
@@ -238,7 +153,7 @@ internal sealed class AegisGen : IIncrementalGenerator
                     yield break;
                 }
 
-                ReadSchemaIndexes(reader{{settables.Select(x => $", out var col{x.Name}")}});
+                {{_[AppendIndexesReading(_, model)]}}
             
                 do
                 {
@@ -267,7 +182,7 @@ internal sealed class AegisGen : IIncrementalGenerator
                     return result;
                 }
 
-                ReadSchemaIndexes(reader{{properties.Select(x => $", out var col{x.Name}")}});
+                {{_[AppendIndexesReading(_, model)]}}
             
                 do
                 {
@@ -301,7 +216,7 @@ internal sealed class AegisGen : IIncrementalGenerator
                     return result;
                 }
             
-                ReadSchemaIndexes(reader{{settables.Select(x => $", out var col{x.Name}")}});
+                {{_[AppendIndexesReading(_, model)]}}
             
                 Task<bool> reading;
 
@@ -339,7 +254,7 @@ internal sealed class AegisGen : IIncrementalGenerator
                     yield break;
                 }
 
-                ReadSchemaIndexes(reader{{settables.Select(x => $", out var col{x.Name}")}});
+                {{_[AppendIndexesReading(_, model)]}}
             
                 Task<bool> reading;
 
@@ -362,14 +277,37 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static IndentedInterpolatedStringHandler AppendReadSchemaIndexes(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
-        var settables = model.Settables;
-        var required = model.RequiredSettables;
+        var complexTypes = model.Settables.Where(x => !x.IsPrimitive)
+            .Select(x => (x, TraverseSettables(model.Inner![x.Type.DisplayString])))
+            .ToDictionary(k => k.x, v => v.Item2);
+
+        foreach(var complexType in complexTypes)
+        {
+            complexType.Value.ForWhomTheBellTolls = complexType.Key;
+        }
+
+        var settables = model.Settables
+            .Where(x => x.IsPrimitive)
+            .Select(x => (name: x.Name, columnId: x.FieldSource.IsOrder ? x.FieldSource.Order : -1))
+            .Concat(
+                complexTypes.SelectMany(x => x.Value.GetAllVariablesNames())
+                    .Select(x => (name: x, columnId: -1))
+            );
+
+        var required = model.RequiredSettables
+            .Where(x => x.IsPrimitive)
+            .Select(x => x.Name)
+            .Concat(
+                complexTypes.SelectMany(x => x.Value.GetAllRequiredVariables())
+            )
+            .Distinct()
+            .ToImmutableArray();
 
         var type = model.Type;
 
         var alreadySettedIndexes = settables
-            .Where(x => x.FieldSource.IsOrder)
-            .Select(x => x.FieldSource.Order)
+            .Where(x => x.columnId > -1)
+            .Select(x => x.columnId)
             .ToList();
 
         var indexesRangeExcludeZero = Enumerable.Range(1, Math.Max(0, alreadySettedIndexes.Count - 1));
@@ -392,15 +330,13 @@ internal sealed class AegisGen : IIncrementalGenerator
             """]
             
             }}
-            internal static void ReadSchemaIndexes<TReader>(TReader reader{{settables.Select(x => $", out int column{x.Name}")}})
+            internal static void ReadSchemaIndexes<TReader>(TReader reader{{_[settables.Select(x => $", out int column{x.name}"), joinBy: ""]}})
                 where TReader : IDataReader
             {
                 {{_.If(required.Length != 0)[$"ThrowIfNotEnoughFieldsForRequiredException({required.Length}, reader.FieldCount);\n"]
                 
                 }}
-                {{_.Scope[settables.Select(x => x.FieldSource.IsOrder
-                    ? $"column{x.Name} = {x.FieldSource.Order};"
-                    : $"column{x.Name} = -1;"), joinBy: "\n"]}}
+                {{_.Scope[settables.Select(x => $"column{x.name} = {x.columnId};"), joinBy: "\n"]}}
 
                 for(int i = 0; i != reader.FieldCount; i++)
                 {
@@ -420,20 +356,20 @@ internal sealed class AegisGen : IIncrementalGenerator
                     """]]]
 
                     }}
-                    {{_.Scope[$"ReadSchemaColumnIndex(reader.GetName(i), i{settables.Select(x => $", ref column{x.Name}")})"]}};
+                    {{_.Scope[$"ReadSchemaColumnIndex(reader.GetName(i), i{settables.Select(x => $", ref column{x.name}")})"]}};
                 }
                 {{_.Scope.If(required.Length != 0)[
                 $$"""
 
                 int missedCount =
-                    {{_.Scope[required.Select(x => $"column{x.Name} == -1 ? 1 : 0"), joinBy: "+\n"]}};
+                    {{_.Scope[required.Select(x => $"column{x} == -1 ? 1 : 0"), joinBy: "+\n"]}};
 
                 if(missedCount > 0)
                 {
                     string[] missed = new string[missedCount];
                     int writed = 0;
 
-                    {{_.Scope[required.Select(x => $"if(column{x.Name} == -1) missed[writed++] = \"{x.Name}\";"), joinBy: "\n"]}}
+                    {{_.Scope[required.Select(x => $"if(column{x} == -1) missed[writed++] = \"{x}\";"), joinBy: "\n"]}}
 
                     ThrowNoFieldSourceMatchedRequiredSettableException(missed);
                 }
@@ -446,14 +382,35 @@ internal sealed class AegisGen : IIncrementalGenerator
 
     internal static IndentedInterpolatedStringHandler AppendReadSchemaColumnIndex(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
-        var properties = model.Settables;
         var matchCases = model.MatchingSettings.MatchCase;
 
         var namesToMatch = GetNamesToMatch(model, token);
 
+        //var properties = model.Settables.Where(x => x.IsPrimitive).Select(x => x.Name)
+        //    .Concat(namesToMatch.Values.SelectMany(x => x.Select(l => l.settableName)));
+
+        var complexTypes = model.Settables.Where(x => !x.IsPrimitive)
+            .Select(x => (x, TraverseSettables(model.Inner![x.Type.DisplayString])))
+            .ToDictionary(k => k.x, v => v.Item2);
+
+        foreach (var complexType in complexTypes)
+        {
+            complexType.Value.ForWhomTheBellTolls = complexType.Key;
+        }
+
+        var settables = model.Settables
+            .Where(x => x.IsPrimitive)
+            .Select(x => (name: x.Name, columnId: x.FieldSource.IsOrder ? x.FieldSource.Order : -1))
+            .Concat(
+                complexTypes.SelectMany(x => x.Value.GetAllVariablesNames())
+                    .Select(x => (name: x, columnId: -1))
+            )
+            .Select(x => x.name)
+            .ToList();
+
         return _.Scope[
             $$"""
-            internal static void ReadSchemaColumnIndex(string c, int i{{properties.Select(x => $", ref int col{x.Name}")}})
+            internal static void ReadSchemaColumnIndex(string c, int i{{settables.Select(x => $", ref int col{x}")}})
             {
                 switch(c.Length)
                 {
@@ -461,10 +418,10 @@ internal sealed class AegisGen : IIncrementalGenerator
                     case {{n.Key}}:
                         {{_.Scope.ForEach(n.Value, (_, x) => _[$$"""
                             {{(matchCases.HasFlag(MatchCase.IgnoreCase)
-                        ? $"if(col{x.property.Name} == -1 && string.Equals(c, \"{x.name}\", StringComparison.OrdinalIgnoreCase))"
-                        : $"if(col{x.property.Name} == -1 && c == \"{x.name}\")")}}
+                        ? $"if(col{x.settableName} == -1 && string.Equals(c, \"{x.name}\", StringComparison.OrdinalIgnoreCase))"
+                        : $"if(col{x.settableName} == -1 && c == \"{x.name}\")")}}
                             {
-                                col{{x.property.Name}} = i;
+                                col{{x.settableName}} = i;
                                 return;
                             }
                             """])}}
@@ -476,34 +433,186 @@ internal sealed class AegisGen : IIncrementalGenerator
             """];
     }
 
+    internal static IndentedInterpolatedStringHandler AppendIndexesReading(IndentStackWriter _, MatchingModel model)
+    {
+        //var required = model.RequiredSettables;
+
+        //var requiredComplex = model.RequiredSettables.Where(x => !x.IsPrimitive).ToList();
+        //var requiredPrimitives = model.RequiredSettables.Where(x => x.IsPrimitive)
+        //    .Select(x => (displayString: x.Type.DisplayString, x.Name))
+        //    .ToList();
+
+        //var optional = model.UsualSettables;
+
+
+
+
+
+        //var namesToMatch = GetNamesToMatch(model);
+
+        //var settables = model.Settables.Where(x => x.IsPrimitive).Select(x => x.Name)
+        //    .Concat(namesToMatch.Values.SelectMany(x => x.Select(l => l.settableName))).Distinct();
+
+
+
+
+        var complexTypes = model.Settables.Where(x => !x.IsPrimitive)
+            .Select(x => (x, TraverseSettables(model.Inner![x.Type.DisplayString])))
+            .ToDictionary(k => k.x, v => v.Item2);
+
+        foreach (var complexType in complexTypes)
+        {
+            complexType.Value.ForWhomTheBellTolls = complexType.Key;
+        }
+
+        var settables = model.Settables
+            .Where(x => x.IsPrimitive)
+            .Select(x => (name: x.Name, columnId: x.FieldSource.IsOrder ? x.FieldSource.Order : -1))
+            .Concat(
+                complexTypes.SelectMany(x => x.Value.GetAllVariablesNames())
+                    .Select(x => (name: x, columnId: -1))
+            )
+            .Select(x => x.name)
+            .ToList();
+
+        //Dictionary<Settable, Mental> complexMaps = model.Settables.Where(x => !x.IsPrimitive)
+        //    .Select(x => (x, TraverseSettables(model.Inner![x.Type.DisplayString])))
+        //    .ToDictionary(k => k.x, v => v.Item2);
+
+        //var settables = model.Settables
+        //    .Where(x => x.IsPrimitive)
+        //    .Select(x => x.Name)
+        //    .Concat(complexMaps.Values.SelectMany(x => x.GetAllVariablesNames()));
+
+        return _[$"ReadSchemaIndexes(reader{_[settables.Select(x => $", out var col{x}"), joinBy: ""]});"];
+    }
+
     internal static IndentedInterpolatedStringHandler AppendParsingBody(IndentStackWriter _, MatchingModel model, CancellationToken token = default)
     {
         var required = model.RequiredSettables;
+
+        var requiredComplex = model.RequiredSettables.Where(x => !x.IsPrimitive).ToList();
+        var requiredPrimitives = model.RequiredSettables.Where(x => x.IsPrimitive)
+            .Select(x => (displayString: x.Type.DisplayString, x.Name))
+            .ToList();
+
         var optional = model.UsualSettables;
+
+        Dictionary<Settable, Mental> complexMaps = model.Settables.Where(x => !x.IsPrimitive)
+            .Select(x => (x, TraverseSettables(model.Inner![x.Type.DisplayString])))
+            .ToDictionary(k => k.x, v => v.Item2);
+
+        foreach (var map in complexMaps)
+        {
+            map.Value.ForWhomTheBellTolls = map.Key;
+        }
+
+        //requiredPrimitives.AddRange(
+        //    complexMaps.Where(x => x.Key.Required)
+        //    .SelectMany(x => x.Value.GetRequiredVariablesAndTheirTypes())
+        //    .Select(x => (displayString: x.settable.Type.DisplayString, varName: x.variableName))
+        //);
 
         return _.Scope[
             $$"""
             {{_[required.Length == 0
                 ? _[$"var parsed = new {model.Type.Name}();"]
                 : _[$$"""
-                    {{_[required.Select(x => $"{x.Type.DisplayString} val{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"), joinBy: "\n"]}}
 
                     var parsed = new {{model.Type.Name}}()
                     {
-                        {{_.Scope.ForEach(required, (_, x) => _[$"{x.Name} = val{x.Name}"], joinBy: ",\n")}}
-                    }; 
+                        {{_.Scope.ForEach(requiredComplex, (_, x) => appendInner(_, "parsed", x, complexMaps[x]), joinBy: ",\n")}}{{_.Scope[requiredPrimitives.Count > 0 && requiredComplex.Count > 0 ? ",\n" : string.Empty]}}
+                        {{_.If(requiredPrimitives.Count > 0)[_.Scope[
+                            requiredPrimitives.Select(x => $"{x.Name} = ({x.displayString})reader[col{x.Name}]"),
+                            joinBy: ",\n"
+                        ]]
+                        }}
+                    };
                     """]
             ]}}
             
             {{_.Scope.ForEach(optional, (w, x) => x.Type.IsReference
                 ? w[$"if(col{x.Name} != -1) parsed.{x.Name} = reader[col{x.Name}] as {x.Type.DisplayString};"]
                 : w[$"if(col{x.Name} != -1 && reader[col{x.Name}] is {x.Type.DisplayString} p{x.Name}) parsed.{x.Name} = p{x.Name};"],
-                joinBy: "\n")}}
+                joinBy: "\n")
+            
+            }}{{_.Scope.ForEach(requiredComplex, (_, x) => appendInnerOptionals(_, "parsed", x, complexMaps[x]))}}
             """
         ];
+
+        IndentedInterpolatedStringHandler appendInner(IndentStackWriter _, string accessPrefix, Settable settablya, Mental mental, bool checkRequired = false)
+        {
+            var required = mental!.GetAllRequiredVariables().ToList();
+            var pairs = mental.GetRequiredVariablesPrimitives();
+            var complex = mental.GetRequiredVariablesComplex().ToList();
+
+            var access = accessPrefix + "." + settablya.Name;
+
+            if(!checkRequired)
+            {
+                return _[$$"""
+                {{_[settablya.Name]}} = new {{_[settablya.Type.DisplayString]}}()
+                {
+                    {{_.Scope.ForEach(pairs, (_, x) => _[$"{x.settable.Name} = ({x.settable.Type.DisplayString})reader[col{x.variableName}]"], joinBy: ",\n")}}
+                    {{_[complex.Count > 0 ? ",\n" : string.Empty]}}
+                    {{_.Scope.ForEach(complex, (_, x) => appendInner(_, access, x.settable, x.mental, false))}}
+                }
+                """];
+            }
+
+            // TODO: if a property doesn't have required settables, then it instance needs to be created if one of its optional settable exists in reader instance
+            //var zeroRequiredWithOptionalsComplex = mental.GetZeroRequiredComplexWithOptionals().ToList();
+            //var zeroOptionals = zeroRequiredWithOptionalsComplex.SelectMany(x => x.instances.Select(instance => instance.variableName)).ToList();
+
+            return _.Scope[$$"""
+                if({{_[required.Select(x => $"col{x} != -1"), joinBy: " && "]}})
+                {
+                    {{_[access]}} = new {{_[settablya.Type.DisplayString]}}()
+                    {
+                        {{_.Scope.ForEach(pairs, (_, x) => _[$"{x.settable.Name} = ({x.settable.Type.DisplayString})reader[col{x.variableName}]"], joinBy: ",\n")
+                        
+                        }}{{_[complex.Count > 0 ? ",\n" : string.Empty]
+                        
+                        }}{{
+                            _.Scope.ForEach(complex, (_, x) => appendInner(_, access, x.settable, x.mental, false))
+                        }}
+                    };{{appendInnerOptionals(_, accessPrefix, settablya, mental)}}
+                }
+                """
+            ];
+        }
+
+        IndentedInterpolatedStringHandler appendInnerOptionals(IndentStackWriter _, string accessPrefix, Settable settablya, Mental mental)
+        {
+            var access = accessPrefix + "." + settablya.Name;
+
+            var optional = mental.GetOptionalVariablesPrimitives().ToList();
+
+            if (optional.Count > 0)
+            {
+                var skip = _.Scope[$$"""
+
+                    {{_.Scope.ForEach(optional, (w, x) => x.settable.Type.IsReference
+                        ? w[$"if(col{x.variableName} != -1) {access}.{x.settable.Name} = reader[col{x.settable.Name}] as {x.settable.Type.DisplayString};"]
+                        : w[$"if(col{x.variableName} != -1 && reader[col{x.variableName}] is {x.settable.Type.DisplayString} p{x.variableName}) {access}.{x.settable.Name} = p{x.variableName};"],
+                        joinBy: "\n")}}
+
+                    """
+                ];
+            }
+
+            var optionalComplex = mental.GetOptionalVariablesComplex().ToList();
+
+            foreach (var inner in optionalComplex)
+            {
+                appendInner(_, access, inner.settable, inner.mental, checkRequired: true);
+            }
+
+            return default;
+        }
     }
 
-    internal static SortedDictionary<int, List<(string name, Settable property)>> GetNamesToMatch(MatchingModel model, CancellationToken token = default)
+    internal static SortedDictionary<int, List<(string name, string settableName)>> GetNamesToMatch(MatchingModel model, CancellationToken token = default)
     {
         if (token.IsCancellationRequested) return [];
 
@@ -511,78 +620,49 @@ internal sealed class AegisGen : IIncrementalGenerator
         var type = model.Type;
         var matchCases = model.MatchingSettings.MatchCase;
 
-        var namesToMatch = new SortedDictionary<int, List<(string name, Settable property)>>();
-        var names = new List<string>();
+        var namesToMatch = new SortedDictionary<int, List<(string name, string settableName)>>();
+        var names = new HashSet<string>();
 
         foreach (var settable in settables)
         {
             if (token.IsCancellationRequested) return [];
 
-            if(!settable.FieldSource.TryGetFields(out var fieldSources))
+            if (!settable.FieldSource.TryGetFields(out var fieldSources))
             {
                 continue;
             }
 
-            foreach (var fieldSoruce in fieldSources)
+            var settableName = settable.Name;
+
+            var sourcesAndVariables = fieldSources.Select(x => (variable: settableName, fieldSource: x));
+
+            if(!settable.IsPrimitive)
             {
-                if (matchCases.HasFlag(MatchCase.IgnoreCase))
+                sourcesAndVariables = [];
+
+                foreach (var field in fieldSources)
                 {
-                    var lowerCase =
-                        matchCases.HasFlag(MatchCase.MatchOriginal) ||
-                        matchCases.HasFlag(MatchCase.CamalCase) ||
-                        matchCases.HasFlag(MatchCase.PascalCase)
-                        ? fieldSoruce.ToLower()
-                        : null;
+                    var mental = TraverseSettables(model.Inner![settable.Type.DisplayString], field, settable.Name + "_");
+                    var r = mental.GetVariablesAndTheirSources()
+                        .SelectMany(x =>
+                            x.sources.Select(s =>
+                                (x.variableName, s)
+                            )
+                        );
 
-                    if (lowerCase != null)
-                    {
-                        if (!namesToMatch.TryGetValue(lowerCase.Length, out var sameLength))
-                        {
-                            namesToMatch[lowerCase.Length] = sameLength = [];
-                        }
-
-                        sameLength.Add((lowerCase, settable));
-                    }
-
-                    var snake = matchCases.HasFlag(MatchCase.SnakeCase)
-                        ? MatchCaseGenerator.ToSnakeCase(fieldSoruce)
-                        : null;
-
-                    if (snake != null && snake != lowerCase)
-                    {
-                        if (!namesToMatch.TryGetValue(snake.Length, out var sameLength))
-                        {
-                            namesToMatch[snake.Length] = sameLength = [];
-                        }
-
-                        sameLength.Add((snake, settable));
-                    }
-
-                    continue;
+                    sourcesAndVariables = sourcesAndVariables.Concat(r);
                 }
+            }
 
-                if (matchCases.HasFlag(MatchCase.MatchOriginal))
-                {
-                    var original = fieldSoruce;
-                    names.Add(original);
-                }
+            foreach (var (variableName, fieldSoruce) in sourcesAndVariables)
+            {
+                IEnumerable<string> cases;
 
-                if (matchCases.HasFlag(MatchCase.SnakeCase))
-                {
-                    var snake = MatchCaseGenerator.ToSnakeCase(fieldSoruce);
-                    if (!names.Contains(snake)) names.Add(snake);
-                }
+                cases = matchCases.ToAllCasesForCompare(fieldSoruce);
 
-                if (matchCases.HasFlag(MatchCase.CamalCase))
+                foreach (var fieldSourcInCase in cases)
                 {
-                    var camel = MatchCaseGenerator.ToCamelCase(fieldSoruce);
-                    if (!names.Contains(camel)) names.Add(camel);
-                }
-
-                if (matchCases.HasFlag(MatchCase.PascalCase))
-                {
-                    var pascal = MatchCaseGenerator.ToPascalCase(fieldSoruce);
-                    if (!names.Contains(pascal)) names.Add(pascal);
+                    names.Add(fieldSoruce);
                 }
 
                 foreach (var nameCase in names)
@@ -592,11 +672,13 @@ internal sealed class AegisGen : IIncrementalGenerator
                         namesToMatch[nameCase.Length] = sameLength = [];
                     }
 
-                    sameLength.Add((nameCase, settable));
+                    sameLength.Add((nameCase, variableName));
                 }
-            }
 
-            names.Clear();
+                names.Clear();
+            }
+            
+            //names.Clear();
         }
 
         foreach (var sameLengthNames in namesToMatch)
@@ -605,6 +687,178 @@ internal sealed class AegisGen : IIncrementalGenerator
         }
 
         return namesToMatch;
+    }
+
+    internal static Mental TraverseSettables(MatchingModel model, string prefixSettableName = "", string prefixVarName = "")
+    {
+        var mental = new Mental() { Orig = model };
+
+        foreach (var settable in model.Settables)
+        {
+            var ff = settable.FieldSource.TryGetFields(out var fields)
+                ? fields
+                : [settable.Name];
+
+            if (settable.IsPrimitive)
+            {
+                var varName = prefixVarName + settable.Name;
+
+                foreach (var field in ff)
+                {
+                    mental.Add(settable, varName, prefixSettableName + field);
+                }
+            }
+            else
+            {
+                foreach (var field in ff)
+                {
+                    var inner = TraverseSettables(model.Inner![settable.Type.DisplayString], prefixSettableName + field, prefixVarName + settable.Name + "_");
+
+                    inner.ForWhomTheBellTolls = settable;
+                    
+                    mental.Inner.Add((inner, settable.Required));
+                }
+            }
+        }
+
+        return mental;
+    }
+
+    internal sealed class Mental
+    {
+        public Settable? ForWhomTheBellTolls { get; set; }
+
+        public List<(Mental inner, bool required)> Inner { get; set; } = [];
+
+        public MatchingModel Orig { get; set; }
+
+        public Dictionary<Settable, (string variableName, List<string> sources)> RequiredColumnSourcesFixed { get; set; } = [];
+        public Dictionary<Settable, (string variableName, List<string> sources)> OtherColumnSourcesFixed { get; set; } = [];
+
+        public void Add(Settable settable, string variableName, string source)
+        {
+            var dest = settable.Required
+                ? RequiredColumnSourcesFixed
+                : OtherColumnSourcesFixed;
+
+            if (!dest.TryGetValue(settable, out var finded))
+            {
+                dest[settable] = finded = (variableName, []);
+            }
+
+            finded.sources.Add(source);
+        }
+
+        public IEnumerable<(Mental inner, Settable Value, List<(Settable settable, string variableName)> instances)> GetZeroRequiredComplexWithOptionals()
+        {
+            var result = Inner
+                .Where(x => !x.required && x.inner.RequiredColumnSourcesFixed.Count == 0 && x.inner.OtherColumnSourcesFixed.Count(x => x.Key.IsPrimitive) > 0)
+                .Select(x => (x.inner, x.inner.ForWhomTheBellTolls!.Value, instances: x.inner.OtherColumnSourcesFixed.Where(x => x.Key.IsPrimitive).Select(x => (settable: x.Key, (ForWhomTheBellTolls != null ? ForWhomTheBellTolls.Value.Name + "_" : "") + "_" + x.Value.variableName)).ToList()));
+
+            foreach(var inner in Inner)
+            {
+                result = result.Concat(inner.inner.GetZeroRequiredComplexWithOptionals());
+            }
+
+            return result;
+        }
+
+        public IEnumerable<(Settable settable, string variableName)> GetRequiredVariablesPrimitives()
+        {
+            var result = RequiredColumnSourcesFixed.Where(x => x.Key.IsPrimitive)
+                .Select(x => (x.Key, (ForWhomTheBellTolls != null ? ForWhomTheBellTolls.Value.Name + "_" : "") + x.Value.variableName));
+
+            return result;
+        }
+
+        public IEnumerable<(Settable settable, Mental mental)> GetRequiredVariablesComplex()
+        {
+            var result = Inner.Where(x => x.required)
+                .Select(x => (x.inner.ForWhomTheBellTolls!.Value, x.inner));
+
+            return result;
+        }
+
+        public IEnumerable<(Settable settable, string variableName)> GetOptionalVariablesPrimitives()
+        {
+            var result = OtherColumnSourcesFixed.Where(x => x.Key.IsPrimitive)
+                .Select(x => (x.Key, (ForWhomTheBellTolls != null ? ForWhomTheBellTolls.Value.Name + "_" : "") + x.Value.variableName));
+
+            return result;
+        }
+
+        public IEnumerable<(Settable settable, Mental mental)> GetOptionalVariablesComplex()
+        {
+            var result = Inner.Where(x => !x.required)
+                .Select(x => (x.inner.ForWhomTheBellTolls!.Value, x.inner));
+
+            return result;
+        }
+
+        public IEnumerable<(Settable settable, string variableName, List<string> sources)> GetRequiredVariablesAndTheirTypes()
+        {
+            var result = RequiredColumnSourcesFixed.Select(x => (x.Key, (ForWhomTheBellTolls != null ? ForWhomTheBellTolls.Value.Name + "_" : "") + x.Value.variableName, x.Value.sources));
+
+            foreach (var inner in Inner.Select(x => x.inner))
+            {
+                result = result.Concat(inner.GetRequiredVariablesAndTheirTypes());
+            }
+
+            return result;
+        }
+
+        public IEnumerable<(Settable settable, List<string> sources)> GetVariablesAndTheirTypes()
+        {
+            var result = RequiredColumnSourcesFixed.Select(x => (x.Key, x.Value.sources))
+                    .Concat(OtherColumnSourcesFixed.Select(x => (x.Key, x.Value.sources)));
+
+            foreach (var inner in Inner.Select(x => x.inner))
+            {
+                result = result.Concat(inner.GetVariablesAndTheirTypes());
+            }
+
+            return result;
+        }
+
+        public IEnumerable<(string variableName, List<string> sources)> GetVariablesAndTheirSources()
+        {
+            var result = RequiredColumnSourcesFixed.Select(x => ((ForWhomTheBellTolls != null ? ForWhomTheBellTolls.Value.Name + "_" : "") + x.Value.variableName, x.Value.sources))
+                    .Concat(OtherColumnSourcesFixed.Select(x => ((ForWhomTheBellTolls != null ? ForWhomTheBellTolls.Value.Name + "_" : "") + x.Value.variableName, x.Value.sources)));
+
+            foreach (var inner in Inner.Select(x => x.inner))
+            {
+                result = result.Concat(inner.GetVariablesAndTheirSources());
+            }
+
+            return result;
+        }
+
+        public IEnumerable<string> GetAllRequiredVariables()
+        {
+            IEnumerable<string> anchor = RequiredColumnSourcesFixed.Select(x => (ForWhomTheBellTolls != null ? ForWhomTheBellTolls.Value.Name + "_" : "") + x.Value.variableName);
+
+            foreach (var inner in Inner.Where(x => x.required).Select(x => x.inner))
+            {
+                anchor = anchor.Concat(inner.GetAllRequiredVariables());
+            }
+
+            return anchor;
+        }
+
+        public IEnumerable<string> GetAllVariablesNames()
+        {
+            var others = OtherColumnSourcesFixed.Select(x => (ForWhomTheBellTolls != null ? ForWhomTheBellTolls.Value.Name + "_" : "") + x.Value.variableName);
+            var anchor = RequiredColumnSourcesFixed
+                    .Select(x => (ForWhomTheBellTolls != null ? ForWhomTheBellTolls.Value.Name + "_" : "") + x.Value.variableName)
+                    .Concat(others);
+
+            foreach (var inner in Inner.Select(x => x.inner))
+            {
+                anchor = anchor.Concat(inner.GetAllVariablesNames().Select(x => inner.ForWhomTheBellTolls!.Value.Name + "_" + x));
+            }
+
+            return anchor;
+        }
     }
 }
 
@@ -686,7 +940,9 @@ internal readonly struct MatchingModel
     public readonly TypeSnapshot Type;
     public readonly MatchingSettings MatchingSettings;
 
-    public MatchingModel(TypeSnapshot type, Settable[] settables, MatchingSettings matchingSettings)
+    public readonly Dictionary<string, MatchingModel>? Inner = default;
+
+    public MatchingModel(TypeSnapshot type, Settable[] settables, MatchingSettings matchingSettings, Dictionary<string, MatchingModel>? inner = null)
     {
         Type = type;
         MatchingSettings = matchingSettings;
@@ -701,6 +957,7 @@ internal readonly struct MatchingModel
         Settables = ImmutableArray.Create(settables);
         RequiredSettables = requiredSettables;
         UsualSettables = otherSettables;
+        Inner = inner;
     }
 
     private static readonly Comparer<Settable> _comparer = Comparer<Settable>.Create(static (x, y) => (x, y) switch
@@ -710,8 +967,17 @@ internal readonly struct MatchingModel
         _ => y.DeclarationOrder - x.DeclarationOrder
     });
 }
+internal readonly struct ParserStaticMethod
+{
+    public readonly string CallId;
+    public readonly string TargetType;
 
-internal struct Settable
+    public ParserStaticMethod(string callId, string targetType)
+        => (CallId, TargetType) = (callId, targetType);
+}
+
+
+internal readonly struct Settable
 {
     public readonly TypeSnapshot Type;
     public readonly FieldsOrOrder FieldSource;
@@ -719,22 +985,25 @@ internal struct Settable
     public readonly int DeclarationOrder;
     public readonly bool Required;
 
+    public bool IsPrimitive => Type.IsPrimitive;
+
     public Settable(TypeSnapshot type, string name, FieldsOrOrder fieldSource, bool required, int declarationOrder)
         => (Name, Type, FieldSource, DeclarationOrder, Required)
         = (name, type, fieldSource, declarationOrder, required);
 }
 
-internal readonly struct TypeSnapshot
-{
-    public readonly NamespaceSnapshot Namespace;
-    public readonly string Name;
-    public readonly string DisplayString;
-    public readonly bool IsReference;
+internal readonly record struct TypeSnapshot(string Name, string DisplayString, bool IsReference, bool IsPrimitive, NamespaceSnapshot Namespace);
+//{
+    //public readonly NamespaceSnapshot Namespace;
+    //public readonly string Name;
+    //public readonly string DisplayString;
+    //public readonly bool IsReference;
+    //public readonly bool IsPrimitive;
 
-    public TypeSnapshot(string name, string displayString, bool isReference, NamespaceSnapshot namespaceShapshot)
-        => (Name, DisplayString, IsReference, Namespace)
-        = (name, displayString, isReference, namespaceShapshot);
-}
+    //public TypeSnapshot(string name, string displayString, bool isReference, bool isPrimitive, NamespaceSnapshot namespaceShapshot)
+    //    => (Name, DisplayString, IsReference, IsPrimitive, Namespace)
+    //    = (name, displayString, isReference, isPrimitive, namespaceShapshot);
+//}
 
 internal readonly struct NamespaceSnapshot
 {
