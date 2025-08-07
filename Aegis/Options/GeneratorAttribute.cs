@@ -121,7 +121,7 @@ internal static class MatchCaseGenerator
     }
 
     public static bool Has(this MatchCase cases, MatchCase flag)
-        => (cases & flag) == flag;
+        => (cases & flag) != 0;
 
     public static bool Has(this MatchCase cases, MatchCase flag1, MatchCase flag2)
         => cases.Has(flag1 | flag2);

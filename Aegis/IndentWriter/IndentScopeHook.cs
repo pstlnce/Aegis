@@ -111,6 +111,37 @@ internal readonly struct IndentScopeHook
         return string.Empty;
     }
 
+    public string ForEach<T>(ImmutableArray<T> source, Func<IndentStackWriter, T, string> write, string joinBy = "\n\n")
+    {
+        var enumerator = source.GetEnumerator();
+
+        if (!enumerator.MoveNext())
+        {
+            End();
+            return string.Empty;
+        }
+
+        var previous = enumerator.Current;
+        bool end;
+
+        do
+        {
+            write(_writer, previous);
+
+            if (end = !enumerator.MoveNext())
+            {
+                continue;
+            }
+
+            _writer.AppendLineSplitted(joinBy.AsSpan());
+            previous = enumerator.Current;
+
+        } while (!end);
+
+        End();
+        return string.Empty;
+    }
+
     public string ForEach<T>(IEnumerable<T> source, Func<IndentStackWriter, T, IndentedInterpolatedStringHandler> write, string joinBy = "\n\n")
     {
         using var enumerator = source.GetEnumerator();

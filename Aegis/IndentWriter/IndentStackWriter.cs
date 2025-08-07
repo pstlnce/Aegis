@@ -81,7 +81,43 @@ internal sealed class IndentStackWriter
         }
     }
 
-    public void Append(string value) => AppendLineSplitted(value.AsSpan());
+    public IndentStackWriter AddIndentEnsured()
+    {
+        _ = TryAddIndent();
+        return this;
+    }
+
+    public bool TryAddIndent()
+    {
+        var lastLine = LastLine.Span;
+
+        if (!lastLine.IsEmpty && !lastLine.IsAddedNewLine() && lastLine.IsWhiteSpace())
+        {
+            AddIndent(lastLine);
+            return true;
+        }
+
+        return false;
+    }
+
+    public void RemoveIndentIfAdded(bool isAdded)
+    {
+        if (isAdded)
+        {
+            PopIndent();
+        }
+    }
+
+    public IndentStackWriter Append([InterpolatedStringHandlerArgument("")] IndentedInterpolatedStringHandler handler)
+    {
+        return this;
+    }
+
+    public IndentStackWriter Append(string value)
+    {
+        AppendLineSplitted(value.AsSpan());
+        return this;
+    }
 
     public void AppendLineSplitted(ReadOnlySpan<char> source)
     {

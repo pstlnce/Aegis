@@ -36,6 +36,21 @@ Console.ReadLine();
 
 return;
 
+public sealed class Exm : Attribute
+{
+    public Exm(string[] mapperrrrr)
+    {
+
+    }
+}
+
+public sealed class MMM
+{
+    public int A { get; set; }
+
+    public MMM MMM2 { get; set; }
+}
+
 [
     AegisAgent(Case = MatchCase.IgnoreCase),
     Some(Map = ["", 1, 3, null!]),

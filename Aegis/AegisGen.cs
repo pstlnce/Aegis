@@ -38,8 +38,10 @@ internal sealed class AegisGen : IIncrementalGenerator
 
         context.RegisterSourceOutput(collectionEpilogue, (context, items) =>
         {
-            var parsers = items.Left.ToParsers(context);
-            GenerateDataReaderParsers(context, items.Right, parsers);
+            //var parsers = items.Left.ToParsers(context);
+            //GenerateDataReaderParsers(context, items.Right, parsers);
+
+            DifferentWay.GenerateDataReaderParsers(context, items.Right);
         });
     }
 

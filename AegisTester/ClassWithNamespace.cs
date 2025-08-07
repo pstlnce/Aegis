@@ -2,8 +2,32 @@
 
 namespace AegisTester
 {
+    internal class InnerClass2
+    {
+        public int Ttt1 { get; set; }
+        public int Ttt2 { get; set; }
+        public int Ttt3 { get; set; }
+        public string Ttt4 { get; set; }
+
+        public InnerClass Complex { get; set; }
+        public InnerClass Com_____Plex { get; set; }
+    }
+
+    internal class InnerClass3
+    {
+        public required int RequiredTest { get; set; }
+
+        public required int RequiredTest2 { get; set; }
+
+        public InnerClass Optional { get; set; }
+    }
+
     internal class InnerClass
     {
+        public required int RequiredTest { get; set; }
+
+        public required int RequiredTest2 { get; set; }
+
         public int Faf { get; set; }
 
         public DateTime SosiSuchara { get; set; }
@@ -21,7 +45,15 @@ namespace AegisTester
         [FieldSource("bb")]
         public required bool RequiredBoolean { get; set; }
 
+        public required InnerClass3 _3 { get; set; }
+
         public required InnerClass Inner { get; set; }
+
+        public required InnerClass Req { get; set; }
+
+        public InnerClass NotRequired { get; set; }
+
+        public InnerClass2 OptionalWithZeroRequired { get; set; }
 
         [Parser]
         public static bool Parse(System.Object f)
