@@ -499,20 +499,32 @@ internal sealed class LambdaWriter<T>(T source, Func<T, IndentStackWriter, Inden
     }
 }
 
+internal struct DefferedCrawlingAmount
+{
+    public int ParentId;
+    public int Count;
+}
+
+internal struct DefferedCrawlingTarget
+{
+
+}
 
 internal readonly struct CrawlerSection2(
     int index,
     ModelToParse source,
     SettableToParse link,
     IEnumerator<(SettableToParse link, ModelToParse next)> complex,
+    bool isRequired,
     int childIndex
 )
 {
-    public int Index => index;
-    public int ChildIndex => childIndex;
     public SettableToParse Link { get; } = link;
     public ModelToParse Source { get; } = source;
     public IEnumerator<(SettableToParse link, ModelToParse next)> Complex { get; } = complex;
+    public int Index => index;
+    public int ChildIndex => childIndex;
+    public bool IsRequired => isRequired;
 }
 
 internal struct CrawlerSlice(ModelToParse source, int requiredSimpleIndex, int requiredSimpleCount, int notRequiredSimpleIndex, int notRequiredSimpleCount)
@@ -524,6 +536,7 @@ internal struct CrawlerSlice(ModelToParse source, int requiredSimpleIndex, int r
     public string TypeDisplayName { get; set; } = source.Type.DisplayName;
 
     public int ParentIndex { get; set; } = -1;
+    public bool ParentIsRequired { get; set; }
     public bool IsRequired { get; set; }
 
     public int RequiredSimpleIndex { get; set; } = requiredSimpleIndex;
@@ -540,20 +553,33 @@ internal struct CrawlerSlice(ModelToParse source, int requiredSimpleIndex, int r
     public int NotReqChildsSimplesCount { get; set; }
 
     public int FirstChildIndex { get; set; } = -1;
-    public int SiblingIndex { get; set; } = -1;
 
     public int LastReqRecursiveChildIndex { get; set; } = -1;
     public int LastRecursiveChildIndex { get; set; } = -1;
 
     public int ReqComplexCount { get; set; }
+
+    public int FirstRequiredChildIndex { get; set; } = -1;
+    public int RequiredChildCount { get; set; }
+    public int RequiredRecursiveChildCount { get; set; }
+
+    public readonly int AllRequiredChildCount => RequiredChildCount + RequiredRecursiveChildCount;
+
+    public int FirstOptionalChildeIndex { get; set; }
+    public int OptionalChildCount { get; set; }
+    public int OptionalRecursiveChildCount { get; set; }
+
+    public readonly int AllOptionalChildCount => OptionalChildCount + OptionalRecursiveChildCount;
 }
 
 internal sealed class SettablesCollected
-    (Memory<CrawlerSlice> slices,
+    (Memory<CrawlerSlice> optionalSlices,
+    Memory<CrawlerSlice> requiredSlices,
     Memory<SettableToParse> requiredPrimitives,
     Memory<SettableToParse> notRequiredPrimitives)
 {
-    public Memory<CrawlerSlice> Slices { get; set; } = slices;
+    public Memory<CrawlerSlice> Slices { get; set; } = optionalSlices;
+    public Memory<CrawlerSlice> RequiredSlices { get; set; } = requiredSlices;
     public Memory<SettableToParse> RequiredPrimitives { get; set; } = requiredPrimitives;
     public Memory<SettableToParse> OptionalPrimitives { get; set; } = notRequiredPrimitives;
 }
@@ -572,6 +598,8 @@ internal static class SettableCrawlerEnumerator2
         var path = new Stack<CrawlerSection2>();
 
         var slices = new List<CrawlerSlice>();
+        var optionalSlices = new List<CrawlerSlice>();
+
         var allRequiredSimple = new List<SettableToParse>();
         var allNotRequiredSimple = new List<SettableToParse>();
 
@@ -579,11 +607,20 @@ internal static class SettableCrawlerEnumerator2
         var complex = EnumerateRequiredFirst(current.ComplexSettables).GetEnumerator();
 
         var previousIndex = 0;
+        var currentRequired = false;
 
         while(true)
         {
             var reqSimpleCount = 0;
             var simpleCount = 0;
+
+#if DEBUG
+            if(current.Type.DisplayName.EndsWith("InnerClass"))
+            {
+
+            }
+#endif
+
 
             foreach (var settable in current.Settables)
             {
@@ -601,15 +638,22 @@ internal static class SettableCrawlerEnumerator2
             var reqSimpleIndex = allRequiredSimple.Count - reqSimpleCount;
             var simpleIndex = allNotRequiredSimple.Count - simpleCount;
 
-            slices.Add(new(
-                source: current,
-                requiredSimpleIndex: reqSimpleIndex,
-                requiredSimpleCount: reqSimpleCount,
-                notRequiredSimpleIndex: simpleIndex,
-                notRequiredSimpleCount: simpleCount
-            ));
+            int index;
+            {
+                var destinataion = currentRequired ? slices : optionalSlices;
 
-            var index = slices.Count - 1;
+                index = destinataion.Count;
+                destinataion.Add(new(
+                    source: current,
+                    requiredSimpleIndex: reqSimpleIndex,
+                    requiredSimpleCount: reqSimpleCount,
+                    notRequiredSimpleIndex: simpleIndex,
+                    notRequiredSimpleCount: simpleCount
+                )
+                {
+                    FirstRequiredChildIndex = index
+                });
+            }
 
             while (true)
             {
@@ -617,9 +661,22 @@ internal static class SettableCrawlerEnumerator2
                 {
                     var (link, next) = complex.Current;
 
-                    path.Push(new(index: index, source: current, link: link, complex: complex, childIndex: previousIndex));
+                    var destination = currentRequired ? slices.AsSpan() : optionalSlices.AsSpan();
+
+                    destination[index].RequiredChildCount += link.IsRequired ? 1 : 0;
+                    destination[index].OptionalChildCount += link.IsRequired ? 0 : 1;
+
+                    path.Push(new(
+                        index: index,
+                        source: current,
+                        link: link,
+                        complex: complex,
+                        childIndex: previousIndex,
+                        isRequired: currentRequired
+                    ));
 
                     current = next;
+                    currentRequired = link.IsRequired;
                     complex = EnumerateRequiredFirst(next.ComplexSettables).GetEnumerator();
 
                     previousIndex = -1;
@@ -628,41 +685,49 @@ internal static class SettableCrawlerEnumerator2
                 {
                     var poped = path.Pop();
 
-                    var span = slices.AsSpan();
+                    var span = currentRequired ? slices.AsSpan() : optionalSlices.AsSpan();
+                    var parentSpan = poped.IsRequired ? slices.AsSpan() : optionalSlices.AsSpan();
 
                     span[index].ParentIndex = poped.Index;
                     span[index].ParentLink = poped.Link;
-                    span[index].IsRequired = poped.Link.IsRequired;
+                    span[index].IsRequired = poped.Link.IsRequired; // @Speed
+                    span[index].ParentIsRequired = poped.IsRequired;
 
-                    span[poped.Index].ReqChildsReqSimplesCount += (span[index].RequiredSimpleCount + span[index].ReqChildsReqSimplesCount) * (poped.Link.IsRequired ? 1 : 0);
-                    span[poped.Index].NotReqChildsSimplesCount += (span[index].NotRequiredSimpleCount + span[index].NotReqChildsSimplesCount) * (!poped.Link.IsRequired ? 1 : 0);
+                    // TODO: remove later
+                    parentSpan[poped.Index].ReqChildsReqSimplesCount += (span[index].RequiredSimpleCount + span[index].ReqChildsReqSimplesCount) * (poped.Link.IsRequired ? 1 : 0);
+                    parentSpan[poped.Index].NotReqChildsSimplesCount += (span[index].NotRequiredSimpleCount + span[index].NotReqChildsSimplesCount) * (!poped.Link.IsRequired ? 1 : 0);
+
+                    // @Keep
+                    parentSpan[poped.Index].RequiredRecursiveChildCount += (span[index].RequiredChildCount + span[index].RequiredRecursiveChildCount) * (poped.Link.IsRequired ? 1 : 0);
+
+                    parentSpan[poped.Index].OptionalRecursiveChildCount += (span[index].OptionalChildCount + span[index].OptionalRecursiveChildCount) * (poped.Link.IsRequired ? 0 : 1);
 
                     if(span[index].IsRequired)
                     {
-                        span[poped.Index].LastReqRecursiveChildIndex = span[index].LastReqRecursiveChildIndex >= 0
+                        parentSpan[poped.Index].LastReqRecursiveChildIndex = span[index].LastReqRecursiveChildIndex >= 0
                             ? span[index].LastReqRecursiveChildIndex
                             : index;
                     }
 
-                    span[poped.Index].LastRecursiveChildIndex = span[index].LastRecursiveChildIndex >= 0 ? span[index].LastRecursiveChildIndex : index;
+                    parentSpan[poped.Index].LastRecursiveChildIndex = span[index].LastRecursiveChildIndex >= 0 ? span[index].LastRecursiveChildIndex : index;
 
                     previousIndex = index;
 
-                    if(span[poped.Index].FirstChildIndex < 0)
+                    if (parentSpan[poped.Index].FirstRequiredChildIndex < 0)
                     {
-                        span[poped.Index].FirstChildIndex = index;
+                        parentSpan[poped.Index].FirstRequiredChildIndex = index;
                     }
-                    else
-                    {
-                        Debug.Assert(poped.ChildIndex > 0, "There's already child item, so the link to a child before current should exists");
-                        Debug.Assert(span[poped.ChildIndex].SiblingIndex < 0, "There's no way that the previous element has a link already. it should be the first encounter of a sibling");
 
-                        span[poped.ChildIndex].SiblingIndex = index;
+                    // TODO: remove later
+                    if(parentSpan[poped.Index].FirstChildIndex < 0)
+                    {
+                        parentSpan[poped.Index].FirstChildIndex = index;
                     }
 
                     index = poped.Index;
                     current = poped.Source;
                     complex = poped.Complex;
+                    currentRequired = poped.IsRequired;
 
                     continue;
                 }
@@ -676,17 +741,23 @@ internal static class SettableCrawlerEnumerator2
         }
 
     Exit:
-        Debug.Assert(slices.Count > 0);
+        Debug.Assert(optionalSlices.Count > 0);
         //Debug.Assert(slices[0].RequiredSimpleCount + slices[0].ReqChildsReqSimplesCount == allRequiredSimple.Count);
         //Debug.Assert(slices[0].NotRequiredSimpleCount + slices[0].NotReqChildsSimplesCount == allNotRequiredSimple.Count);
-        Debug.Assert(slices.Count == 1 || slices[0].FirstChildIndex == 1);
+        //Debug.Assert(slices.Count == 1 || slices[0].FirstChildIndex == 1);
+
+#if DEBUG
+#endif
 
 #if DEBUG
         for (int i = 1; slices.Count > 2 && i < slices.Count; i++)
         {
+            // invalidated due to removal of SiblingIndex
+            /*
             var itemLinkin = slices.FindIndex(x => x.FirstChildIndex == i || x.SiblingIndex == i);
-            Debug.Assert(itemLinkin >= 0, "There's should be a link to an item in some way", "There's no link to item at index: {0}", i);
+            Debug.Assert(itemLinkin >= 0, "There should be a link to an item in some way", "There's no link to item at index: {0}", i);
             Debug.Assert(slices[i].ParentIndex >= 0, "Every child nodes should have a link to a parent node");
+            */
 
             // TODO: Fix checks
             if (false && slices[i].AllRequiredSimpleCount != slices[i].RequiredSimpleCount)
@@ -709,7 +780,8 @@ internal static class SettableCrawlerEnumerator2
         }
 #endif
         return new SettablesCollected(
-            slices: slices.AsMemory(),
+            optionalSlices: optionalSlices.AsMemory(),
+            requiredSlices: slices.AsMemory(),
             requiredPrimitives: allRequiredSimple.AsMemory(),
             notRequiredPrimitives: allNotRequiredSimple.AsMemory()
         );
@@ -894,7 +966,9 @@ internal static class SettableCrawlerEnumerator2
     // TODO: passing per settable fails when it comes to complex settable that doesn't have any required settables, but you need to create them anyway
     internal static void PrintParseStep(
         ref ParseStep step,
+        ref Span<CrawlerSlice> slices,
         Span<SettableToParse> settables,
+        ref CrawlerSlice current,
         int sliceIndex,
         int parentIndex,
         IndentStackWriter w,
@@ -907,14 +981,14 @@ internal static class SettableCrawlerEnumerator2
     {
         if(step.Depth == 0)
         { }
-        else if (step.PreviousParentIndex > parentIndex)
+        else if (false && step.PreviousParentIndex > parentIndex)
         {
             step.Depth -= 1;
 
             w.PopIndent();
             w.Append("\n}");
         }
-        else if(step.PreviousParentIndex == parentIndex && !step.PreviousIsEmpty)
+        else if(false && step.PreviousParentIndex == parentIndex && !step.PreviousIsEmpty)
         {
             step.Depth -= 1;
 
@@ -957,6 +1031,32 @@ internal static class SettableCrawlerEnumerator2
             w.Append("] is p ? p : default");
         }
 
+        if(current.ParentIndex >= 0 && current.LastReqRecursiveChildIndex < 0)
+        {
+            if(settables.Length > 0)
+            {
+                step.Depth -= 1;
+                Debug.Assert(step.Depth >= 0, "Closed more scope braces than opened");
+
+                w.PopIndent();
+                w.Append("\n}");
+            }
+
+            var ccurrent = slices[current.ParentIndex];
+
+            // TODO::
+            while(ccurrent.LastReqRecursiveChildIndex == sliceIndex && ccurrent.ParentIndex > 0)
+            {
+                step.Depth -= 1;
+                Debug.Assert(step.Depth >= 0, "Closed more scope braces than opened");
+
+                w.PopIndent();
+                w.Append("\n}");
+
+                ccurrent = slices[ccurrent.ParentIndex];
+            }
+        }
+
         step.PreviousParentIndex = parentIndex;
         step.PreviousIsEmpty = !hasAnyRequired;
     }
@@ -964,6 +1064,7 @@ internal static class SettableCrawlerEnumerator2
     public static void IterateThrough(SettablesCollected collected, IndentStackWriter w)
     {
         var slices   = collected.Slices.Span;
+        var rSlices  = collected.RequiredSlices.Span;
         var required = collected.RequiredPrimitives.Span;
         var optional = collected.OptionalPrimitives.Span;
 
@@ -978,12 +1079,12 @@ internal static class SettableCrawlerEnumerator2
         ref var first = ref slices[0];
 
         // Main looping
-        for (int i = 0; i < slices.Length; i++)
+        for(int i = 0; i < slices.Length; i++)
         {
             var root = slices[i];
 
-            NextAccessPath(column, target: ref root, previous: pprev, slices, separator: "__");
-            NextAccessPath(access, target: ref root, previous: pprev, slices, separator: ".");
+            NextAccessPath(column, target: ref root, previous: pprev, slices, requiredSlices: rSlices, separator: "__", initialValue: "");
+            NextAccessPath(access, target: ref root, previous: pprev, slices, requiredSlices: rSlices, separator: ".", initialValue: "parsed");
 
             var columnInitialLength = column.Length;
             var accessInitialLength = access.Length;
@@ -1020,6 +1121,7 @@ internal static class SettableCrawlerEnumerator2
 
             int endOfIteration;
 
+            /*
             if (root.LastReqRecursiveChildIndex >= 0)
             {
                 endOfIteration = root.LastReqRecursiveChildIndex;
@@ -1036,41 +1138,54 @@ internal static class SettableCrawlerEnumerator2
             {
                 endOfIteration = i;
             }
+            */
 
-            for (var ch = i; ch <= endOfIteration; ++ch)
+            // TODO: doubles check if(ch == i)
+            if(root.RequiredChildCount > 0)
+            {
+                endOfIteration = i;
+            }
+            else if(root.AllOptionalChildCount > 0)
+            {
+                endOfIteration = i + root.AllOptionalChildCount;
+            }
+            else
+            {
+                endOfIteration = i;
+            }
+
+            for(var ch = i; ch <= endOfIteration; ++ch)
             {
                 var child = slices[ch];
 
-                NextAccessPath(column, ref child, previous: previous, slices: slices, separator: "__");
+                NextAccessPath(column, ref child, previous: previous, slices: slices, requiredSlices: rSlices, separator: "__", initialValue: "");
 
                 previous = child;
 
                 if(child.AllRequiredSimpleCount > 0)
                 {
-                    var endIndex = child.RequiredSimpleIndex + child.AllRequiredSimpleCount;
-
-                    for (var q = child.RequiredSimpleIndex; q < endIndex; )
+                    var columnPrefix = column.ToString();
+                    for(var q = child.RequiredSimpleIndex; q < child.RequiredSimpleIndex + child.RequiredSimpleCount; ++q)
                     {
-                        var rootChangePoint = child.RequiredSimpleIndex + child.RequiredSimpleCount;
-                        var columnPrefix = column.ToString();
+                        PrintStep(ref step, sliceIndex: ch, parentIndex: child.ParentIndex, w, required[q].Name, ref columnPrefix, containsRequired: true, isRequired: true);
+                    }
 
-                        for (; rootChangePoint > q; q++)
+                    for(var r = child.FirstRequiredChildIndex; r < child.FirstRequiredChildIndex + child.AllRequiredChildCount; ++r)
+                    {
+                        var inner = rSlices[r];
+
+                        NextAccessPath(sb: column, target: ref inner, previous: previous, slices: slices, requiredSlices: rSlices, separator: "__", initialValue: "");
+
+                        previous = inner;
+
+                        columnPrefix = column.ToString();
+                        for(var q = child.RequiredSimpleIndex; q < child.RequiredSimpleIndex + child.RequiredSimpleCount; ++q)
                         {
-                            PrintStep(ref step, sliceIndex: ch, parentIndex: child.ParentIndex, w, required[q].Name, ref columnPrefix, containsRequired: true, child.IsRequired);
-                        }
-
-                        if (q < endIndex)
-                        {
-                            var prev = child;
-
-                            ch += 1;
-                            child = previous = slices[ch];
-
-                            NextAccessPath(sb: column, target: ref child, previous: prev, slices: slices, separator: "__");
+                            PrintStep(ref step, sliceIndex: ch, parentIndex: child.ParentIndex, w, required[q].Name, ref columnPrefix, containsRequired: true, isRequired: true);
                         }
                     }
 
-                    if(ch == i)
+                    if (ch == i)
                     {
                         break; // for root only required primitives need to be ckecked
                     }
@@ -1083,7 +1198,7 @@ internal static class SettableCrawlerEnumerator2
 
                     for (var q = child.NotRequiredSimpleIndex; q < endIndex; q++)
                     {
-                        PrintStep(ref step, sliceIndex: ch, parentIndex: child.ParentIndex, w, optional[q].Name, ref columnPrefix, containsRequired: false, child.IsRequired);
+                        PrintStep(ref step, sliceIndex: ch, parentIndex: child.ParentIndex, w, optional[q].Name, ref columnPrefix, containsRequired: false, isRequired: false);
                     }
                 }
             }
@@ -1112,51 +1227,50 @@ internal static class SettableCrawlerEnumerator2
             var parseStep = default(ParseStep);
             parseStep.PreviousParentIndex = root.ParentIndex;
 
-            bool initialRun = true;
+            PrintParseStep(
+                step: ref parseStep,
+                slices: ref rSlices,
+                settables: required.Slice(root.RequiredSimpleIndex, root.RequiredSimpleCount),
+                current: ref root,
+                sliceIndex: i,
+                parentIndex: root.ParentIndex,
+                w: w,
+                notFirstParentElement: false,
+                hasAnyRequired: root.AllRequiredSimpleCount > 0 || root.LastReqRecursiveChildIndex > 0,
+                colstr: column.ToString(),
+                typeName: root.TypeDisplayName,
+                access: rootAccess
+            );
 
-            for (var (r, ch) = (root.RequiredSimpleIndex, i); initialRun || r < root.RequiredSimpleIndex + root.AllRequiredSimpleCount; )
+            previous = root;
+            for (var r = root.FirstRequiredChildIndex; r < root.FirstRequiredChildIndex + root.AllRequiredChildCount; ++r)
             {
-                initialRun = false;
+                var reqChild = rSlices[r];
 
-                var reqChild = slices[ch];
+                NextAccessPath(column, target: ref reqChild, previous: previous, slices, requiredSlices: rSlices, separator: "__", initialValue: "");
 
-                var columnPrefix = column.ToString();
+                previous = reqChild;
 
                 PrintParseStep(
                     step: ref parseStep,
+                    slices: ref rSlices,
                     settables: required.Slice(reqChild.RequiredSimpleIndex, reqChild.RequiredSimpleCount),
-                    sliceIndex: ch,
+                    current: ref reqChild,
+                    sliceIndex: r,
                     parentIndex: reqChild.ParentIndex,
                     w: w,
                     notFirstParentElement:
-                        !(ch == i ||
-                        //(slices[reqChild.ParentIndex].AllRequiredSimpleCount == 0 &&
-                            ch == slices[reqChild.ParentIndex].FirstChildIndex
-                        //)
-
-                        ),
-                    hasAnyRequired: reqChild.AllRequiredSimpleCount > 0,
-                    colstr: columnPrefix,
+                        reqChild.ParentIndex == i
+                        ? root.RequiredSimpleCount > 0 || r != root.FirstRequiredChildIndex
+                        : rSlices[reqChild.ParentIndex].RequiredSimpleCount > 0 || r != rSlices[reqChild.ParentIndex].FirstChildIndex,
+                    hasAnyRequired: reqChild.AllRequiredSimpleCount > 0 || reqChild.LastReqRecursiveChildIndex > 0,
+                    colstr: column.ToString(),
                     typeName: reqChild.TypeDisplayName,
-                    access: ch == i ? rootAccess : reqChild.ParentLink.Name
+                    access: r == i ? rootAccess : reqChild.ParentLink!.Name
                 );
-
-                r = reqChild.RequiredSimpleIndex + reqChild.RequiredSimpleCount;
-
-                if (r < root.RequiredSimpleIndex + root.AllRequiredSimpleCount)
-                {
-                    var reqPrevious = reqChild;
-                    
-                    ch += 1;
-                    reqChild = slices[ch];
-
-                    NextAccessPath(column, target: ref reqChild, previous: reqPrevious, slices, separator: "__");
-                }
-                else
-                {
-                    KeepPrefixOnly(column, columnInitialLength);
-                }
             }
+            
+            KeepPrefixOnly(column, columnInitialLength);
 
             EndParseStep(parseStep.Depth, w);
 
@@ -1194,6 +1308,36 @@ internal static class SettableCrawlerEnumerator2
                         """);
                     }
                 }
+
+                previous = root;
+                for(var ch = root.FirstRequiredChildIndex; ch < root.FirstRequiredChildIndex + root.AllRequiredChildCount; ++ch)
+                {
+                    var inner = rSlices[ch];
+
+                    NextAccessPath(column, target: ref inner, previous: previous, slices, requiredSlices: rSlices, separator: "__", initialValue: "");
+                    NextAccessPath(access, target: ref inner, previous: previous, slices, requiredSlices: rSlices, separator: ".", initialValue: "parsed");
+
+                    previous = inner;
+
+                    rootAccess2 = access.ToString();
+                    rootColumn = column.ToString();
+
+                    for (var opt = root.NotRequiredSimpleIndex; opt < root.NotRequiredSimpleIndex + root.NotRequiredSimpleCount; opt++)
+                    {
+                        var settable = optional[opt];
+
+                        w.Append("\n\n");
+                        w.Append($$"""
+                        if(colInner__{{rootColumn}}_{{settable.Name}} != -1)
+                        {
+                            {{rootAccess2}}.{{settable.Name}} = reader[colInner__{{rootColumn}}_{{settable.Name}}] is {{settable.TypeDisplayName}} p ? p : default;
+                        }
+                        """);
+                    }
+                }
+
+                KeepPrefixOnly(column, columnInitialLength);
+                KeepPrefixOnly(access, accessInitialLength);
             }
 
             // escaping if scopes
@@ -1204,7 +1348,8 @@ internal static class SettableCrawlerEnumerator2
                     var parentIndex = root.ParentIndex;
 
                     // it means we added if(...) { ...
-                    if(first.LastReqRecursiveChildIndex < i // we omitted if for the top lvl element
+                    if(true && // TODO
+                        first.LastReqRecursiveChildIndex < i // we omitted if for the top lvl element
                         && !root.IsRequired
                         && root.AllRequiredSimpleCount + root.AllNotRequiredSimpleCount > 0)
                     {
@@ -1241,12 +1386,43 @@ internal static class SettableCrawlerEnumerator2
 
     internal static void KeepPrefixOnly(StringBuilder sb, int prefixSize)
     {
+        // TODO: change after changing the algorithm
+        return;
+        
         var deleteSize = sb.Length - prefixSize;
         sb.Remove(prefixSize, deleteSize);
     }
 
-    internal static void NextAccessPath(StringBuilder sb, ref CrawlerSlice target, CrawlerSlice previous, Span<CrawlerSlice> slices, string separator)
+    internal static void NextAccessPath(StringBuilder sb, ref CrawlerSlice target, CrawlerSlice previous, Span<CrawlerSlice> slices, Span<CrawlerSlice> requiredSlices, string separator, string initialValue)
     {
+        // TODO: temporary amgorithm
+        var stack = new Stack<string>();
+
+        var current = target;
+        while (current.ParentIndex > 0)
+        {
+            stack.Push(current.ParentLink.Name);
+            current = (current.ParentIsRequired ? requiredSlices : slices)[current.ParentIndex];
+        }
+
+        sb.Clear();
+        sb.Append(initialValue);
+
+        var notInitial = false;
+
+        while(stack.Count > 0)
+        {
+            sb.Append(stack.Pop());
+            if(notInitial)
+            {
+                sb.Append(separator);
+            }
+
+            notInitial = true;
+        }
+
+        return;
+
         if(target.ParentIndex > previous.ParentIndex)
         {
             WindUp(sb, ref target, separator);
@@ -1264,14 +1440,14 @@ internal static class SettableCrawlerEnumerator2
         }
         else if(target.ParentIndex != previous.ParentIndex)
         {
-            Unroll(sb, ref target, previous, slices, separator);
+            Unroll(sb, ref target, previous, slices, requiredSlices, separator);
             WindUp(sb, ref target, separator);
         }
     }
 
     internal static void WindUp(StringBuilder sb, ref CrawlerSlice target, string separator)
     {
-        if(sb.Length > 0)
+        if(sb.Length != 0)
         {
             sb.Append(separator);
         }
@@ -1279,7 +1455,7 @@ internal static class SettableCrawlerEnumerator2
         sb.Append(target.ParentLink.Name);
     }
 
-    internal static void Unroll(StringBuilder sb, ref CrawlerSlice target, CrawlerSlice previous, Span<CrawlerSlice> slices, string separator)
+    internal static void Unroll(StringBuilder sb, ref CrawlerSlice target, CrawlerSlice previous, Span<CrawlerSlice> slices, Span<CrawlerSlice> requiredSlices, string separator)
     {
         Debug.Assert(
             previous.ParentIndex >= target.ParentIndex,
@@ -1294,7 +1470,7 @@ internal static class SettableCrawlerEnumerator2
         while(previous.ParentIndex != target.ParentIndex)
         {
             Debug.Assert(previous.ParentIndex >= 0);
-            previous = slices[previous.ParentIndex];
+            previous = (previous.ParentIsRequired ? requiredSlices : slices)[previous.ParentIndex];
 
             removeAmount += previous.ParentLink.Name.Length;
             removeAmount += separator.Length;
