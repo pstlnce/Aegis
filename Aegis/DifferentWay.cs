@@ -499,15 +499,10 @@ internal sealed class LambdaWriter<T>(T source, Func<T, IndentStackWriter, Inden
     }
 }
 
-internal struct DefferedCrawlingAmount
-{
-    public int ParentId;
-    public int Count;
-}
-
 internal struct DefferedCrawlingTarget
 {
-
+    public IEnumerator<(SettableToParse link, ModelToParse next)> Complex;
+    public int ParentIndex;
 }
 
 internal readonly struct CrawlerSection2(
@@ -516,7 +511,8 @@ internal readonly struct CrawlerSection2(
     SettableToParse link,
     IEnumerator<(SettableToParse link, ModelToParse next)> complex,
     bool isRequired,
-    int childIndex
+    int childIndex,
+    int parentIndex
 )
 {
     public SettableToParse Link { get; } = link;
@@ -525,6 +521,7 @@ internal readonly struct CrawlerSection2(
     public int Index => index;
     public int ChildIndex => childIndex;
     public bool IsRequired => isRequired;
+    public int ParentIndex => parentIndex;
 }
 
 internal struct CrawlerSlice(ModelToParse source, int requiredSimpleIndex, int requiredSimpleCount, int notRequiredSimpleIndex, int notRequiredSimpleCount)
@@ -597,6 +594,8 @@ internal static class SettableCrawlerEnumerator2
     {
         var path = new Stack<CrawlerSection2>();
 
+        var deffered = new Stack<DefferedCrawlingTarget>();
+
         var slices = new List<CrawlerSlice>();
         var optionalSlices = new List<CrawlerSlice>();
 
@@ -609,18 +608,13 @@ internal static class SettableCrawlerEnumerator2
         var previousIndex = 0;
         var currentRequired = false;
 
+        var parentIndex = -1;
+        var defferedCount = 0;
+
         while(true)
         {
             var reqSimpleCount = 0;
             var simpleCount = 0;
-
-#if DEBUG
-            if(current.Type.DisplayName.EndsWith("InnerClass"))
-            {
-
-            }
-#endif
-
 
             foreach (var settable in current.Settables)
             {
@@ -638,22 +632,19 @@ internal static class SettableCrawlerEnumerator2
             var reqSimpleIndex = allRequiredSimple.Count - reqSimpleCount;
             var simpleIndex = allNotRequiredSimple.Count - simpleCount;
 
-            int index;
-            {
-                var destinataion = currentRequired ? slices : optionalSlices;
+            var index = slices.Count;
 
-                index = destinataion.Count;
-                destinataion.Add(new(
-                    source: current,
-                    requiredSimpleIndex: reqSimpleIndex,
-                    requiredSimpleCount: reqSimpleCount,
-                    notRequiredSimpleIndex: simpleIndex,
-                    notRequiredSimpleCount: simpleCount
-                )
-                {
-                    FirstRequiredChildIndex = index
-                });
-            }
+            slices.Add(new(
+                source: current,
+                requiredSimpleIndex: reqSimpleIndex,
+                requiredSimpleCount: reqSimpleCount,
+                notRequiredSimpleIndex: simpleIndex,
+                notRequiredSimpleCount: simpleCount
+            )
+            {
+                FirstRequiredChildIndex = index,
+                ParentIndex = parentIndex,
+            });
 
             while (true)
             {
@@ -672,62 +663,80 @@ internal static class SettableCrawlerEnumerator2
                         link: link,
                         complex: complex,
                         childIndex: previousIndex,
-                        isRequired: currentRequired
+                        isRequired: currentRequired,
+                        parentIndex: parentIndex
                     ));
 
                     current = next;
                     currentRequired = link.IsRequired;
                     complex = EnumerateRequiredFirst(next.ComplexSettables).GetEnumerator();
+                    parentIndex = index;
 
                     previousIndex = -1;
+                }
+                else if(defferedCount != 0)
+                {
+                    // TODO: maybe add onto path
+                    // The problem is that parent slices needs to be updated as child elements are added
+                    // so the algorothm should take path back to this point through all parents,
+                    // while we are referencing maybe deep nested node directly from relatively top-level node
+                    Debug.Assert(deffered.Count != 0, "There's should be deffered slices");
+                    Debug.Assert(defferedCount <= deffered.Count, "There's can't be more deffered elements wait to unrol than in the buffer");
+
+                    var defferedSlice = deffered.Pop();
+                    defferedCount -= 1;
+
+                    index = defferedSlice.ParentIndex;
+                    complex = defferedSlice.Complex;
+
+
                 }
                 else if(path.Count != 0)
                 {
                     var poped = path.Pop();
 
-                    var span = currentRequired ? slices.AsSpan() : optionalSlices.AsSpan();
-                    var parentSpan = poped.IsRequired ? slices.AsSpan() : optionalSlices.AsSpan();
+                    var span = slices.AsSpan();
 
-                    span[index].ParentIndex = poped.Index;
                     span[index].ParentLink = poped.Link;
                     span[index].IsRequired = poped.Link.IsRequired; // @Speed
                     span[index].ParentIsRequired = poped.IsRequired;
 
                     // TODO: remove later
-                    parentSpan[poped.Index].ReqChildsReqSimplesCount += (span[index].RequiredSimpleCount + span[index].ReqChildsReqSimplesCount) * (poped.Link.IsRequired ? 1 : 0);
-                    parentSpan[poped.Index].NotReqChildsSimplesCount += (span[index].NotRequiredSimpleCount + span[index].NotReqChildsSimplesCount) * (!poped.Link.IsRequired ? 1 : 0);
+                    span[poped.Index].ReqChildsReqSimplesCount += (span[index].RequiredSimpleCount + span[index].ReqChildsReqSimplesCount) * (poped.Link.IsRequired ? 1 : 0);
+                    span[poped.Index].NotReqChildsSimplesCount += (span[index].NotRequiredSimpleCount + span[index].NotReqChildsSimplesCount) * (!poped.Link.IsRequired ? 1 : 0);
 
                     // @Keep
-                    parentSpan[poped.Index].RequiredRecursiveChildCount += (span[index].RequiredChildCount + span[index].RequiredRecursiveChildCount) * (poped.Link.IsRequired ? 1 : 0);
+                    span[poped.Index].RequiredRecursiveChildCount += (span[index].RequiredChildCount + span[index].RequiredRecursiveChildCount) * (poped.Link.IsRequired ? 1 : 0);
 
-                    parentSpan[poped.Index].OptionalRecursiveChildCount += (span[index].OptionalChildCount + span[index].OptionalRecursiveChildCount) * (poped.Link.IsRequired ? 0 : 1);
+                    span[poped.Index].OptionalRecursiveChildCount += (span[index].OptionalChildCount + span[index].OptionalRecursiveChildCount) * (poped.Link.IsRequired ? 0 : 1);
 
                     if(span[index].IsRequired)
                     {
-                        parentSpan[poped.Index].LastReqRecursiveChildIndex = span[index].LastReqRecursiveChildIndex >= 0
+                        span[poped.Index].LastReqRecursiveChildIndex = span[index].LastReqRecursiveChildIndex >= 0
                             ? span[index].LastReqRecursiveChildIndex
                             : index;
                     }
 
-                    parentSpan[poped.Index].LastRecursiveChildIndex = span[index].LastRecursiveChildIndex >= 0 ? span[index].LastRecursiveChildIndex : index;
+                    span[poped.Index].LastRecursiveChildIndex = span[index].LastRecursiveChildIndex >= 0 ? span[index].LastRecursiveChildIndex : index;
 
                     previousIndex = index;
 
-                    if (parentSpan[poped.Index].FirstRequiredChildIndex < 0)
+                    if (span[poped.Index].FirstRequiredChildIndex < 0)
                     {
-                        parentSpan[poped.Index].FirstRequiredChildIndex = index;
+                        span[poped.Index].FirstRequiredChildIndex = index;
                     }
 
                     // TODO: remove later
-                    if(parentSpan[poped.Index].FirstChildIndex < 0)
+                    if(span[poped.Index].FirstChildIndex < 0)
                     {
-                        parentSpan[poped.Index].FirstChildIndex = index;
+                        span[poped.Index].FirstChildIndex = index;
                     }
 
                     index = poped.Index;
                     current = poped.Source;
                     complex = poped.Complex;
                     currentRequired = poped.IsRequired;
+                    parentIndex = poped.ParentIndex;
 
                     continue;
                 }
@@ -1344,9 +1353,6 @@ internal static class SettableCrawlerEnumerator2
             {
                 if(i != 0 && root.LastRecursiveChildIndex < 0)
                 {
-                    var scopeOwner = slices[root.ParentIndex];
-                    var parentIndex = root.ParentIndex;
-
                     // it means we added if(...) { ...
                     if(true && // TODO
                         first.LastReqRecursiveChildIndex < i // we omitted if for the top lvl element
@@ -1359,14 +1365,18 @@ internal static class SettableCrawlerEnumerator2
                         depth -= 1;
                     }
 
+                    var scopeOwner = (root.ParentIsRequired ? rSlices : slices)[root.ParentIndex];
+                    var parentIndex = root.ParentIndex;
+                    
                     while (parentIndex > 0 && scopeOwner.LastRecursiveChildIndex == i)
                     {
                         w.PopIndent();
                         w.Append("\n}");
 
                         depth -= 1;
+                        Debug.Assert(depth >= 0);
 
-                        scopeOwner = slices[parentIndex];
+                        scopeOwner = (scopeOwner.ParentIsRequired ? rSlices : slices)[parentIndex];
                         parentIndex = scopeOwner.ParentIndex;
                     }
                 }
