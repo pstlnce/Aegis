@@ -19,7 +19,7 @@ namespace AegisTester
 
         public required int RequiredTest2 { get; set; }
 
-        public InnerClass Optional { get; set; }
+        //public InnerClass Optional { get; set; }
     }
 
     internal class InnerClass

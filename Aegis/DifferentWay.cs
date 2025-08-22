@@ -502,32 +502,57 @@ internal sealed class LambdaWriter<T>(T source, Func<T, IndentStackWriter, Inden
 internal struct DefferedCrawlingTarget
 {
     public IEnumerator<(SettableToParse link, ModelToParse next)> Complex;
-    public int ParentIndex;
+    public int Index;
 }
 
 internal readonly struct CrawlerSection2(
     int index,
     ModelToParse source,
-    SettableToParse link,
-    IEnumerator<(SettableToParse link, ModelToParse next)> complex,
+    IEnumerator<(SettableToParse link, ModelToParse next)> requiredComplex,
+    IEnumerator<(SettableToParse link, ModelToParse next)> optionalComplex,
     bool isRequired,
-    int childIndex,
+    int defferedFrom,
+    int defferedCount,
+    int undefferedCount,
+    int iteratedDefferedsCount,
+    bool traversedRequireds,
+    bool traversedOptionals,
+    bool traverseDeffered,
+    SettableToParse parentLink,
     int parentIndex
 )
 {
-    public SettableToParse Link { get; } = link;
-    public ModelToParse Source { get; } = source;
-    public IEnumerator<(SettableToParse link, ModelToParse next)> Complex { get; } = complex;
+    public ModelToParse Source => source;
+    
+    public IEnumerator<(SettableToParse link, ModelToParse next)> RequiredComplex => requiredComplex;
+
+    public IEnumerator<(SettableToParse link, ModelToParse next)> OptionalComplex => optionalComplex;
+    
     public int Index => index;
-    public int ChildIndex => childIndex;
+    
     public bool IsRequired => isRequired;
+
+    public bool TraversedRequireds => traversedRequireds;
+
+    public bool TraversedOptionals => traversedOptionals;
+
+    public bool TraverseDeffered => traverseDeffered;
+
     public int ParentIndex => parentIndex;
+
+    public int DefferedFrom => defferedFrom;
+
+    public int DefferedCount => defferedCount;
+
+    public int UndefferedCount => undefferedCount;
+
+    public int IteratedDefferedsCount => iteratedDefferedsCount;
+
+    public SettableToParse ParentLink => parentLink;
 }
 
 internal struct CrawlerSlice(ModelToParse source, int requiredSimpleIndex, int requiredSimpleCount, int notRequiredSimpleIndex, int notRequiredSimpleCount)
 {
-    public ModelToParse Source { set; get; } = source;
-
     public SettableToParse ParentLink { get; set; } = default!;
 
     public string TypeDisplayName { get; set; } = source.Type.DisplayName;
@@ -569,13 +594,11 @@ internal struct CrawlerSlice(ModelToParse source, int requiredSimpleIndex, int r
     public readonly int AllOptionalChildCount => OptionalChildCount + OptionalRecursiveChildCount;
 }
 
-internal sealed class SettablesCollected
-    (Memory<CrawlerSlice> optionalSlices,
+internal sealed class SettablesCollected(
     Memory<CrawlerSlice> requiredSlices,
     Memory<SettableToParse> requiredPrimitives,
     Memory<SettableToParse> notRequiredPrimitives)
 {
-    public Memory<CrawlerSlice> Slices { get; set; } = optionalSlices;
     public Memory<CrawlerSlice> RequiredSlices { get; set; } = requiredSlices;
     public Memory<SettableToParse> RequiredPrimitives { get; set; } = requiredPrimitives;
     public Memory<SettableToParse> OptionalPrimitives { get; set; } = notRequiredPrimitives;
@@ -590,26 +613,47 @@ internal static class SettableCrawlerEnumerator2
             .Concat(core.Where(static x => !x.link.IsRequired));
     }
 
+    public static IEnumerator<(SettableToParse link, ModelToParse next)> EnumerateRequired(Dictionary<SettableToParse, ModelToParse> complexSettables)
+    {
+        var core = complexSettables.Select(static x => (link: x.Key, next: x.Value));
+        return core.Where(static x => x.link.IsRequired).GetEnumerator();
+    }
+
+    public static IEnumerator<(SettableToParse link, ModelToParse next)> EnumerateOptional(Dictionary<SettableToParse, ModelToParse> complexSettables)
+    {
+        var core = complexSettables.Select(static x => (link: x.Key, next: x.Value));
+        return core.Where(static x => !x.link.IsRequired).GetEnumerator();
+    }
+
     public static SettablesCollected Collect(this ModelToParse root)
     {
         var path = new Stack<CrawlerSection2>();
 
-        var deffered = new Stack<DefferedCrawlingTarget>();
+        var deffered = new List<DefferedCrawlingTarget>();
 
         var slices = new List<CrawlerSlice>();
-        var optionalSlices = new List<CrawlerSlice>();
 
-        var allRequiredSimple = new List<SettableToParse>();
+        var allRequiredSimple    = new List<SettableToParse>();
         var allNotRequiredSimple = new List<SettableToParse>();
 
         var current = root;
-        var complex = EnumerateRequiredFirst(current.ComplexSettables).GetEnumerator();
 
-        var previousIndex = 0;
-        var currentRequired = false;
+        var requiredComplex = EnumerateRequired(current.ComplexSettables);
+        var optionalComplex = EnumerateOptional(current.ComplexSettables);
 
-        var parentIndex = -1;
-        var defferedCount = 0;
+        var isCurrentRequired = false;
+        var parentLink = default(SettableToParse);
+
+        var parentIndex     = -1;
+        var defferedCount   = 0;
+        var undefferedCount = 0;
+
+        var traversedRequireds = false;
+        var traversedOptionals = false;
+        var traverseDeffered   = false;
+
+        var defferedFrom = 0;
+        var iteratedDefferedsCount = 0;
 
         while(true)
         {
@@ -644,52 +688,246 @@ internal static class SettableCrawlerEnumerator2
             {
                 FirstRequiredChildIndex = index,
                 ParentIndex = parentIndex,
+                IsRequired = isCurrentRequired,
+                ParentLink = parentLink!,
             });
 
+            //TODO: maybe deffereds should be a stack instead
             while (true)
             {
-                if (complex.MoveNext())
+                var traversedRequriedsBefore = traversedRequireds;
+
+                if(!traversedRequireds)
                 {
-                    var (link, next) = complex.Current;
+                    traversedRequireds = !requiredComplex!.MoveNext();
+                }
 
-                    var destination = currentRequired ? slices.AsSpan() : optionalSlices.AsSpan();
+                bool backToParent = isCurrentRequired && traversedRequireds != traversedRequriedsBefore;
+                //Debug.Assert(!backToParent || (traversedRequriedsBefore == true && traversedRequireds == false), "Switching should happen when we ended with required complex settables");
+                Debug.Assert(!backToParent || path.Count != 0, "backToParent means that we need to unroll, therefore 'path' shouldn't be empty");
 
-                    destination[index].RequiredChildCount += link.IsRequired ? 1 : 0;
-                    destination[index].OptionalChildCount += link.IsRequired ? 0 : 1;
+                if (!traversedRequireds)
+                {
+                    var (link, next) = requiredComplex!.Current;
+
+                    var destination = slices.AsSpan();
+
+                    destination[index].RequiredChildCount += 1;
+
+                    // TODO: think about algorithm. Maybe every node should have counter of deffered count
+                    defferedCount += 1;
 
                     path.Push(new(
                         index: index,
                         source: current,
-                        link: link,
-                        complex: complex,
-                        childIndex: previousIndex,
-                        isRequired: currentRequired,
-                        parentIndex: parentIndex
+                        requiredComplex: requiredComplex,
+                        optionalComplex: optionalComplex,
+                        isRequired: isCurrentRequired,
+                        traversedRequireds: traversedRequireds,
+                        traversedOptionals: traversedOptionals,
+                        traverseDeffered: traverseDeffered,
+                        parentLink: parentLink!,
+                        parentIndex: parentIndex,
+                        defferedFrom: defferedFrom,
+                        defferedCount: defferedCount,
+                        iteratedDefferedsCount: iteratedDefferedsCount, // @Optional, could be setted just to 0
+                        undefferedCount: undefferedCount
                     ));
 
                     current = next;
-                    currentRequired = link.IsRequired;
-                    complex = EnumerateRequiredFirst(next.ComplexSettables).GetEnumerator();
+                    isCurrentRequired = true;
+                    parentLink = link;
+
+                    requiredComplex = EnumerateRequired(current.ComplexSettables);
+                    optionalComplex = EnumerateOptional(current.ComplexSettables);
+
+                    parentIndex = index;
+                    iteratedDefferedsCount = 0;
+
+                    // we need to keep them at the are
+                    //undefferedCount = 0;
+                    //defferedCount = 0;
+
+                    traversedRequireds = false;
+                    traverseDeffered = false;
+
+
+                    deffered.Add(new() { Complex = optionalComplex, Index = slices.Count });
+                }
+                else if (
+                    (isCurrentRequired || defferedCount == 0) // optionals should firstly end with deffereds and only then iterate through suboptionals
+                    && (!backToParent || traverseDeffered)
+                    && !(traversedOptionals = traversedOptionals || !optionalComplex.MoveNext())
+                )
+                {
+                    Debug.Assert(traverseDeffered || !isCurrentRequired, "Only requrieds have deffereds");
+
+                    var (link, next) = optionalComplex.Current;
+
+                    //undefferedCount += isCurrentRequired ? 1 : 0;
+
+                    var destination = slices.AsSpan();
+
+                    destination[index].OptionalChildCount += 1;
+
+                    path.Push(new(
+                        index: index,
+                        source: current!,
+                        requiredComplex: requiredComplex!,
+                        optionalComplex: optionalComplex,
+                        isRequired: isCurrentRequired,
+                        traversedRequireds: traversedRequireds,
+                        traversedOptionals: traversedOptionals,
+                        traverseDeffered: traverseDeffered,
+                        parentLink: parentLink!,
+                        parentIndex: parentIndex,
+                        defferedFrom: defferedFrom,
+                        defferedCount: defferedCount,
+                        iteratedDefferedsCount: iteratedDefferedsCount,
+                        undefferedCount: undefferedCount
+                    ));
+
+                    current = next;
+                    isCurrentRequired = false;
+                    parentLink = link;
+                    
+                    requiredComplex = EnumerateRequired(current.ComplexSettables);
+                    optionalComplex = EnumerateOptional(current.ComplexSettables);
+
                     parentIndex = index;
 
-                    previousIndex = -1;
+                    defferedFrom = defferedFrom + defferedCount;
+
+                    // if there's no deffereds, then we should start from 0, otherwise we can overwrite slice if we not move forward 1 step
+                    //if (defferedCount != 0) defferedFrom += 1;
+
+                    defferedCount = 0;
+                    undefferedCount = 0;
+                    iteratedDefferedsCount = 0;
+
+                    traversedRequireds = false;
+                    traversedOptionals = false;
+                    traverseDeffered = false;
                 }
-                else if(defferedCount != 0)
+                else if ((!isCurrentRequired || traverseDeffered) && defferedCount != 0 && defferedCount != undefferedCount)
                 {
+                    // -1 cause we incrementing undefferdCount first, so we would miss the first one at index 0 and iterate over wrong slices,
+                    // that could even not relate to the current slice
+                    var defferedSlice = deffered[defferedFrom + undefferedCount /*- 1*/];
+
+#if !DEBUG
+                    // helping GC to collect instance of IEnumerator
+                    deffered[defferedFrom + undefferedCount /*- 1*/] = default;
+#endif
+
+                    if (slices[index].RequiredChildCount == iteratedDefferedsCount)
+                    {
+                        var poped = path.Pop();
+
+                        // current is optional and the future slice is required
+                        /*if (!isCurrentRequired && poped.IsRequired)
+                        {
+                            if (defferedCount != 0)
+                            {
+                                Debug.Assert(defferedCount == undefferedCount);
+                                deffered.RemoveRange(index: deffered.Count - defferedCount, count: defferedCount);
+                            }
+
+                            undefferedCount = poped.UndefferedCount;
+                            defferedCount = poped.DefferedCount;
+                            defferedFrom = poped.DefferedFrom;
+                        }*/
+
+                        if (!poped.IsRequired && isCurrentRequired)
+                        {
+                            if (defferedCount != 0 && defferedCount == undefferedCount)
+                            {
+                                deffered.RemoveRange(index: defferedFrom, defferedCount);
+
+                                undefferedCount = 0;
+                                defferedCount = 0;
+                                defferedFrom = 0;
+                            }
+                        }
+                        else if (!isCurrentRequired)
+                        {
+                            undefferedCount = poped.UndefferedCount;
+                            defferedCount = poped.DefferedCount;
+                            defferedFrom = poped.DefferedFrom;
+                        }
+
+                        traverseDeffered = poped.TraverseDeffered; // if child is not required but parent is, it means that we processing "defereds"
+
+                        index = poped.Index;
+                        current = poped.Source;
+                        requiredComplex = poped.RequiredComplex;
+                        optionalComplex = poped.OptionalComplex;
+                        isCurrentRequired = poped.IsRequired;
+                        parentIndex = poped.ParentIndex;
+                        parentLink = poped.ParentLink;
+
+                        traversedRequireds = poped.TraversedRequireds;
+                        traversedOptionals = poped.TraversedOptionals;
+
+                        // TODO: add logic: if !isRequired && poped.IsRequired => deffereds.RemoveLast(defferedCount), defferentCount = poped.DefferedCount?
+                        //defferedCount = poped.DefferedCount;
+
+                        iteratedDefferedsCount = poped.IteratedDefferedsCount;
+
+                        continue;
+                    }
+
                     // TODO: maybe add onto path
                     // The problem is that parent slices needs to be updated as child elements are added
                     // so the algorothm should take path back to this point through all parents,
                     // while we are referencing maybe deep nested node directly from relatively top-level node
+                    Debug.Assert(defferedCount > 0);
                     Debug.Assert(deffered.Count != 0, "There's should be deffered slices");
-                    Debug.Assert(defferedCount <= deffered.Count, "There's can't be more deffered elements wait to unrol than in the buffer");
+                    //Debug.Assert(defferedCount <= deffered.Count, "There's can't be more deffered elements wait to unrol than in the buffer");
+                    //Debug.Assert(isCurrentRequired == false, "Required are not responsible for dealing with deffereds");
 
-                    var defferedSlice = deffered.Pop();
-                    defferedCount -= 1;
+                    //defferedCount -= 1;
+                    undefferedCount += 1;
 
-                    index = defferedSlice.ParentIndex;
-                    complex = defferedSlice.Complex;
+                    iteratedDefferedsCount += 1;
 
+                    path.Push(new(
+                        index: index,
+                        source: current,
+                        requiredComplex: default!, // deffered settables are traversed after the required, so at this point there's no need to traverse "requireds"
+                        optionalComplex: optionalComplex,
+                        isRequired: isCurrentRequired,
+                        traversedRequireds: traversedRequireds,
+                        traversedOptionals: traversedOptionals,
+                        traverseDeffered: traverseDeffered,
+                        parentIndex: parentIndex,
+                        defferedFrom: defferedFrom,
+                        defferedCount: defferedCount,
+                        undefferedCount: undefferedCount,
+                        iteratedDefferedsCount: iteratedDefferedsCount,
+                        parentLink: parentLink!
+                    ));
 
+                    traversedRequireds = true;
+                    traversedOptionals = false;
+                    traverseDeffered = true;
+
+                    iteratedDefferedsCount = 0;
+
+                    requiredComplex = default; // we shouldn't enumerate requrieds as we already did it
+                    optionalComplex = defferedSlice.Complex;
+                    isCurrentRequired = true; // otherwise it wouldn't be in deffereds
+
+                    current = default; // idk what the purpose of this
+
+                    parentIndex = index; // the parent is the one who responsible for initiating deffereds processing
+                    index = defferedSlice.Index;
+
+                    Debug.Assert(slices[index].ParentIndex == parentIndex);
+
+                    parentLink = default; // it's probably doesn't do anything in that case at least
+
+                    continue; // escaping from processing primitive settables as we already processed them
                 }
                 else if(path.Count != 0)
                 {
@@ -697,18 +935,21 @@ internal static class SettableCrawlerEnumerator2
 
                     var span = slices.AsSpan();
 
-                    span[index].ParentLink = poped.Link;
-                    span[index].IsRequired = poped.Link.IsRequired; // @Speed
+                    if(poped.Index == 3)
+                    {
+
+                    }
+
                     span[index].ParentIsRequired = poped.IsRequired;
 
                     // TODO: remove later
-                    span[poped.Index].ReqChildsReqSimplesCount += (span[index].RequiredSimpleCount + span[index].ReqChildsReqSimplesCount) * (poped.Link.IsRequired ? 1 : 0);
-                    span[poped.Index].NotReqChildsSimplesCount += (span[index].NotRequiredSimpleCount + span[index].NotReqChildsSimplesCount) * (!poped.Link.IsRequired ? 1 : 0);
+                    span[poped.Index].ReqChildsReqSimplesCount += (span[index].RequiredSimpleCount + span[index].ReqChildsReqSimplesCount) * (isCurrentRequired ? 1 : 0);
+                    span[poped.Index].NotReqChildsSimplesCount += (span[index].NotRequiredSimpleCount + span[index].NotReqChildsSimplesCount) * (!isCurrentRequired ? 1 : 0);
 
                     // @Keep
-                    span[poped.Index].RequiredRecursiveChildCount += (span[index].RequiredChildCount + span[index].RequiredRecursiveChildCount) * (poped.Link.IsRequired ? 1 : 0);
+                    span[poped.Index].RequiredRecursiveChildCount += (span[index].RequiredChildCount + span[index].RequiredRecursiveChildCount) * (isCurrentRequired ? 1 : 0);
 
-                    span[poped.Index].OptionalRecursiveChildCount += (span[index].OptionalChildCount + span[index].OptionalRecursiveChildCount) * (poped.Link.IsRequired ? 0 : 1);
+                    span[poped.Index].OptionalRecursiveChildCount += (span[index].OptionalChildCount + span[index].OptionalRecursiveChildCount) * (isCurrentRequired ? 0 : 1);
 
                     if(span[index].IsRequired)
                     {
@@ -718,8 +959,6 @@ internal static class SettableCrawlerEnumerator2
                     }
 
                     span[poped.Index].LastRecursiveChildIndex = span[index].LastRecursiveChildIndex >= 0 ? span[index].LastRecursiveChildIndex : index;
-
-                    previousIndex = index;
 
                     if (span[poped.Index].FirstRequiredChildIndex < 0)
                     {
@@ -732,11 +971,72 @@ internal static class SettableCrawlerEnumerator2
                         span[poped.Index].FirstChildIndex = index;
                     }
 
+                    //Debug.Assert(defferedCount == 0, "If we unrolling state");
+                    //Debug.Assert(!isCurrentRequired || undefferedCount == 0, "'Required' are responsable to report amount of handled their deffered complex settables");
+
+                    // TODO: defferedCount needs to be setted to 0 somewhere, or it child's undeffered optional complex settable is going to mess up parent's optional node "deffereds"
+                    /*
+                    if(traverseDeffered && !poped.IsRequired)
+                    {
+                        //undefferedCount += poped.UndefferedCount;
+                        defferedCount = poped.DefferedCount - undefferedCount;
+                        
+                        //undefferedCount = 0; doesn't make much sence, bcs we pushing undeffered = 0 onto stack when processing "deffereds" anyway
+                    }
+                    else if(!traverseDeffered && isCurrentRequired)
+                    {
+                        defferedCount += poped.DefferedCount;
+                    }
+                    else if(traverseDeffered && isCurrentRequired && poped.IsRequired)
+                    {
+                        undefferedCount += poped.UndefferedCount;
+                    }
+                    */
+
+                    // current is optional and the future slice is required
+                    /*if(!isCurrentRequired && poped.IsRequired)
+                    {
+                        if(defferedCount != 0)
+                        {
+                            Debug.Assert(defferedCount == undefferedCount);
+                            deffered.RemoveRange(index: deffered.Count - defferedCount, count: defferedCount);
+                        }
+
+                        undefferedCount = poped.UndefferedCount;
+                        defferedCount = poped.DefferedCount;
+                        defferedFrom = poped.DefferedFrom;
+                    }*/
+
+                    if(!poped.IsRequired && isCurrentRequired)
+                    {
+                        if(defferedCount != 0 && defferedCount == undefferedCount)
+                        {
+                            deffered.RemoveRange(index: defferedFrom, defferedCount);
+
+                            undefferedCount = 0;
+                            defferedCount = 0;
+                            defferedFrom = 0;
+                        }
+                    }
+                    else if(!isCurrentRequired)
+                    {
+                        undefferedCount = poped.UndefferedCount;
+                        defferedCount = poped.DefferedCount;
+                        defferedFrom = poped.DefferedFrom;
+                    }
+
                     index = poped.Index;
                     current = poped.Source;
-                    complex = poped.Complex;
-                    currentRequired = poped.IsRequired;
+                    requiredComplex = poped.RequiredComplex;
+                    optionalComplex = poped.OptionalComplex;
+                    isCurrentRequired = poped.IsRequired;
                     parentIndex = poped.ParentIndex;
+                    parentLink = poped.ParentLink;
+
+                    traverseDeffered = poped.TraverseDeffered;
+                    traversedRequireds = poped.TraversedRequireds;
+                    traversedOptionals = poped.TraversedOptionals;
+                    iteratedDefferedsCount = poped.IteratedDefferedsCount;
 
                     continue;
                 }
@@ -750,15 +1050,28 @@ internal static class SettableCrawlerEnumerator2
         }
 
     Exit:
-        Debug.Assert(optionalSlices.Count > 0);
+        Debug.Assert(slices.Count > 0);
+        Debug.Assert(deffered.Count == 0);
         //Debug.Assert(slices[0].RequiredSimpleCount + slices[0].ReqChildsReqSimplesCount == allRequiredSimple.Count);
         //Debug.Assert(slices[0].NotRequiredSimpleCount + slices[0].NotReqChildsSimplesCount == allNotRequiredSimple.Count);
         //Debug.Assert(slices.Count == 1 || slices[0].FirstChildIndex == 1);
 
 #if DEBUG
+        for(int i = 0; slices.Count > 2 && i < slices.Count; i++)
+        {
+            var slice = slices[i];
+
+            for(var r = i + 1; r <= i + slice.RequiredChildCount; r++)
+            {
+                var requiredSlice = slices[r];
+                Debug.Assert(requiredSlice.IsRequired);
+            }
+
+            i += slice.RequiredChildCount;
+        }
 #endif
 
-#if DEBUG
+#if false && DEBUG
         for (int i = 1; slices.Count > 2 && i < slices.Count; i++)
         {
             // invalidated due to removal of SiblingIndex
@@ -789,7 +1102,6 @@ internal static class SettableCrawlerEnumerator2
         }
 #endif
         return new SettablesCollected(
-            optionalSlices: optionalSlices.AsMemory(),
             requiredSlices: slices.AsMemory(),
             requiredPrimitives: allRequiredSimple.AsMemory(),
             notRequiredPrimitives: allNotRequiredSimple.AsMemory()
@@ -1072,6 +1384,7 @@ internal static class SettableCrawlerEnumerator2
 
     public static void IterateThrough(SettablesCollected collected, IndentStackWriter w)
     {
+#if false
         var slices   = collected.Slices.Span;
         var rSlices  = collected.RequiredSlices.Span;
         var required = collected.RequiredPrimitives.Span;
@@ -1392,6 +1705,8 @@ internal static class SettableCrawlerEnumerator2
                 w.Append("\n}");
             }
         }
+
+#endif
     }
 
     internal static void KeepPrefixOnly(StringBuilder sb, int prefixSize)
