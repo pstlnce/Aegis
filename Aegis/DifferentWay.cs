@@ -811,15 +811,6 @@ internal static class SettableCrawlerEnumerator2
                 }
                 else if ((!isCurrentRequired || traverseDeffered) && defferedCount != 0 && defferedCount != undefferedCount)
                 {
-                    // -1 cause we incrementing undefferdCount first, so we would miss the first one at index 0 and iterate over wrong slices,
-                    // that could even not relate to the current slice
-                    var defferedSlice = deffered[defferedFrom + undefferedCount /*- 1*/];
-
-#if !DEBUG
-                    // helping GC to collect instance of IEnumerator
-                    deffered[defferedFrom + undefferedCount /*- 1*/] = default;
-#endif
-
                     if (slices[index].RequiredChildCount == iteratedDefferedsCount)
                     {
                         var poped = path.Pop();
@@ -876,6 +867,15 @@ internal static class SettableCrawlerEnumerator2
 
                         continue;
                     }
+
+                    // -1 cause we incrementing undefferdCount first, so we would miss the first one at index 0 and iterate over wrong slices,
+                    // that could even not relate to the current slice
+                    var defferedSlice = deffered[defferedFrom + undefferedCount /*- 1*/];
+
+#if !DEBUG
+                    // helping GC to collect instance of IEnumerator
+                    deffered[defferedFrom + undefferedCount /*- 1*/] = default;
+#endif
 
                     // TODO: maybe add onto path
                     // The problem is that parent slices needs to be updated as child elements are added
