@@ -10,6 +10,7 @@ using System.Drawing;
 using System.Linq;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -41,32 +42,43 @@ internal static class DifferentWay
             }
 
             var type = model.Value.Type;
-            var _ = new IndentStackWriter(sourceCode);
 
             var typeNamespace = !type.Namespace.IsGlobal ? type.Namespace.DisplayString : null;
 
-            var m = ParseMf(model.Value);
-            var collected = SettableCrawlerEnumerator2.Collect(m);
+            var wr = new IndentStackWriter(sourceCode);
 
-            var sb = new StringBuilder();
-            var wr = new IndentStackWriter(sb);
-            SettableCrawlerEnumerator2.IterateThrough(collected, wr, token);
+            wr.Append($$"""
+                using System;
+                using System.Data;
+                using System.Data.Common;
+                using System.Collections.Generic;
+                using System.Collections.ObjectModel;
+                using System.Runtime.CompilerServices;
+                using System.Threading;
+                using System.Threading.Tasks;
 
-            var cc = sb.ToString();
-
-            continue;
-
-            //MethodsGenerator.ConstructIndexesReading(m, _);
-            var variables = MethodsGenerator.CollectVariables(m);
-            //var indexReadingMethod = MethodsGenerator.ConstructIndexReading(m, variables, MatchCase.IgnoreCase | MatchCase.MatchOriginal);
-
-            //_.WriteScoped(indexReadingMethod);
-
-
-            if (token.IsCancellationRequested) return;
+                {{wr.Scope[
+                    typeNamespace == null
+                    ? AppendClass(wr, model.Value, matchCase)
+                    : wr[$$""" 
+                        namespace {{typeNamespace}}
+                        {
+                            {{AppendClass(wr, model.Value, matchCase)}}
+                        }
+                        """
+                    ]
+                ]}}
+                """
+            );
 
             var sourceCodeText = sourceCode.ToString();
             sourceCode.Clear();
+
+            var fileName = typeNamespace != null
+                ? $"{typeNamespace}.{type.Name}Parser.g.cs"
+                : $"{type.Name}Parser.g.cs";
+
+            productionContext.AddSource(fileName, sourceCodeText);
         }
     }
 
@@ -99,6 +111,199 @@ internal static class DifferentWay
             TypeDisplayName = settable.Type.DisplayString,
         };
     }
+
+    internal static IndentedInterpolatedStringHandler AppendClass(IndentStackWriter _, MatchingModel model, MatchCase matchCase)
+    {
+        var type = model.Type.DisplayString;
+
+        var sb = new StringBuilder();
+        var modelToParse = ParseMf(model);
+
+        var (schemaIndexesReading, indexReading, readIndexesCall) = RenderIndexesReading(sb, modelToParse, matchCase);
+        var parsing = RenderParsing(sb, modelToParse);
+
+        return _.Scope[$$"""
+            internal sealed partial class {{model.Type.Name}}Parser
+            {
+                {{_[AppendReadList(_, type, readIndexesCall, parsing)]}}
+
+                {{_[AppendReadUnbuffered(_, type, readIndexesCall, parsing)]}}
+
+                {{_[AppendReadListAsync(_, type, isValueTask: false, readIndexesCall, parsing)]}}
+
+                {{_[AppendReadListAsync(_, type, isValueTask: true, readIndexesCall, parsing)]}}
+
+                {{_[AppendReadUnbufferedAsync(_, type, readIndexesCall, parsing)]}}
+
+                {{_.Scope[schemaIndexesReading]}}
+
+                {{_.Scope[indexReading]}}
+            }
+            """];
+    }
+
+    internal static IndentedInterpolatedStringHandler AppendReadUnbuffered(IndentStackWriter _, string type, string readIndexesCall, string parsing)
+    {
+        return _.Scope[
+            $$"""
+            internal static IEnumerable<{{type}}> ReadUnbuffered<TReader>(TReader reader)
+                where TReader : IDataReader
+            {
+                if(!reader.Read())
+                {
+                    yield break;
+                }
+
+                {{_.Scope[readIndexesCall]}}
+            
+                do
+                {
+                    {{_.Scope[parsing]}}
+
+                    yield return parsed;
+                } while(reader.Read());
+            }
+            """];
+    }
+
+    internal static IndentedInterpolatedStringHandler AppendReadList(IndentStackWriter _, string type, string readIndexesCall, string parsing)
+    {
+        return _.Scope[
+            $$"""
+            internal static List<{{type}}> ReadList<TReader>(TReader reader)
+                where TReader : IDataReader
+            {
+                var result = new List<{{type}}>();
+
+                if(!reader.Read())
+                {
+                    return result;
+                }
+
+                {{_.Scope[readIndexesCall]}}
+            
+                do
+                {
+                    {{_.Scope[parsing]}}
+
+                    result.Add(parsed);
+                } while(reader.Read());
+            
+                return result;
+            }
+            """];
+    }
+
+    internal static IndentedInterpolatedStringHandler AppendReadListAsync(IndentStackWriter _, string type, bool isValueTask, string readIndexesCall, string parsing)
+    {
+        return _.Scope[
+            $$"""
+            {{_[isValueTask
+              ? _[$"internal static async ValueTask<List<{type}>> ReadListAsyncValue<TReader>(TReader reader, CancellationToken token = default)"]
+              : _[$"internal static async Task<List<{type}>> ReadListAsync<TReader>(TReader reader, CancellationToken token = default)"]
+            ]}}
+                where TReader : DbDataReader
+            {
+                var result = new List<{{type}}>();
+
+                if(!(await reader.ReadAsync(token).ConfigureAwait(false)))
+                {
+                    return result;
+                }
+            
+                {{_.Scope[readIndexesCall]}}
+            
+                Task<bool> reading;
+
+                while(true)
+                {
+                    {{_.Scope[parsing]}}
+
+                    reading = reader.ReadAsync(token);
+
+                    result.Add(parsed);
+
+                    if(!(await reading.ConfigureAwait(false)))
+                    {
+                        break;
+                    }
+                }
+            
+                return result;
+            }
+            """];
+    }
+
+    internal static IndentedInterpolatedStringHandler AppendReadUnbufferedAsync(IndentStackWriter _, string type, string readIndexesCall, string parsing)
+    {
+        return _.Scope[
+            $$"""
+            internal static async IAsyncEnumerable<{{type}}> ReadUnbufferedAsync<TReader>(TReader reader, [EnumeratorCancellationAttribute] CancellationToken token = default)
+                where TReader : DbDataReader
+            {
+                if(!(await reader.ReadAsync(token).ConfigureAwait(false)))
+                {
+                    yield break;
+                }
+
+                {{_.Scope[readIndexesCall]}}
+            
+                Task<bool> reading;
+
+                while(true)
+                {
+                    {{_.Scope[parsing]}}
+
+                    reading = reader.ReadAsync(token);
+
+                    yield return parsed;
+
+                    if(!(await reading.ConfigureAwait(false)))
+                    {
+                        break;
+                    }
+                }
+            }
+            """];
+    }
+
+    internal static string RenderParsing(StringBuilder sb, ModelToParse m)
+    {
+        var collected = SettableCrawlerEnumerator2.Collect(m);
+
+        var wr = new IndentStackWriter(sb);
+
+        SettableCrawlerEnumerator2.IterateThrough(collected, wr);
+
+        return sb.ToString();
+    }
+
+    internal static (string indexes, string index, string call) RenderIndexesReading(StringBuilder sb, ModelToParse model, MatchCase matchCase)
+    {
+        var variables = MethodsGenerator.CollectVariables(model);
+
+        var indexReading = MethodsGenerator.ConstructIndexReading(variables, matchCase);
+        var indexReadingRendered = Render(sb, indexReading);
+
+        var indexesReadingCall = MethodsGenerator.ConstructCallIndexesReading(variables);
+        var indexesReadingCallRendered = Render(sb, indexesReadingCall);
+
+        var indexesReading = MethodsGenerator.ConstructIndexesReading(variables);
+        var indexesReadingRendered = Render(sb, indexesReading);
+
+        return (indexesReadingRendered, indexReadingRendered, indexesReadingCallRendered);
+    }
+
+    internal static string Render(StringBuilder sb, ISmthWriter content)
+    {
+        var writer = new IndentStackWriter(sb);
+        writer.Write(content);
+
+        var result = sb.ToString();
+        sb.Clear();
+
+        return result;
+    }
 }
 
 
@@ -122,66 +327,6 @@ internal interface IMethodArgument
 }
 
 internal interface IMethodBody;
-
-internal sealed class Pipeline
-{
-
-}
-
-internal sealed class FileLevel(ISmthWriter classLevel, IEnumerable<string> additionalNamespaces)
-    : ISmthWriter
-{
-    private static IEnumerable<string> _defaultNamespaces = """
-        using System;
-        using System.Data;
-        using System.Data.Common;
-        using System.Collections.Generic;
-        using System.Collections.ObjectModel;
-        using System.Runtime.CompilerServices;
-        using System.Threading;
-        using System.Threading.Tasks;
-        """.Split('\n');
-
-    private readonly IncludeNamespaces _namespaces = new(_defaultNamespaces.Concat(additionalNamespaces));
-    private readonly ISmthWriter _classLevel = classLevel;
-
-    public void Write(IndentStackWriter writer)
-    {
-        _namespaces.Write(writer);
-        _classLevel.Write(writer);
-    }
-}
-
-internal sealed class ClassLevel(IEnumerable<ISmthWriter> content)
-{
-    private readonly string _modifiers;
-    private readonly string _name;
-
-    public void Write(IndentStackWriter writer)
-    {
-        _ = writer[$$"""
-            {{_modifiers}} class {{_name}}
-            {
-                {{writer.WriteScoped(content)}}
-            }
-            """];
-    }
-}
-
-internal sealed class NamespaceLevel(string @namespace, IEnumerable<ISmthWriter> content) : ISmthWriter
-{
-    private readonly string _namespace = @namespace;
-
-    public void Write(IndentStackWriter writer)
-    {
-        _ = writer[$$"""
-        {{_namespace}}
-        {
-            {{writer.WriteScoped(content)}}
-        }
-        """];
-    }
-}
 
 internal sealed class MethodsGenerator
 {
@@ -249,11 +394,6 @@ internal sealed class MethodsGenerator
         yield break;
     }
 
-    private static ISmthWriter ConstructMethod(JustStringWriter signature, ISmthWriter earlyEscape, ISmthWriter indexesReading, ISmthWriter parsing, ISmthWriter loopingAndReturn)
-    {
-        return new ReadMethod(signature, earlyEscape, indexesReading, loopingAndReturn);
-    }
-
     private static ISmthWriter ConstructSignature(string beforeType, ISmthWriter returningType, string afterType)
     {
         return new ConcatWriter([(JustStringWriter)beforeType, returningType, (JustStringWriter)afterType]);
@@ -269,110 +409,11 @@ internal sealed class MethodsGenerator
             """;
     }
 
-    private static void ConcstructParsing(ModelToParse root, IndentStackWriter writer)
-    {
-        /*
-         var parsed = new <Type>()
-         {
-             required1 = reader[colrequired1] is <t> p ? p : default,
-             required2 = reader[colrequired2] is <t> p ? p : default,
-             required3 = new <T>(), // no required primitives
-             required4 = new <T>() // required and contains required complex types
-             {
-                 r4_r1 = new <T>(),
-                 r4_r2 = new <T>()
-                 {
-                     r4_r2_r1 = reader[col_r4_r2_r1] is <t> p ? p : default,
-                 }
-             },
-         }
-
-         if(col_complex_r1 != -1 && col_complex_r2 != -1)
-         {
-             parsed.complex = new <T>()
-             {
-                 r1 = reader[col_complex_r1] is <t> p ? p : default,
-                 r2 = reader[col_complex_r2] is <t> p ? p : default,
-             }
-
-             if(col_complex_nr1 != -1)
-             {
-                 parsed.complex.nr1 = reader[col_complex_nr1] is <t> p ? p : default;
-             }
-         }
-
-         if(c_cmp_nr1 != -1 || c_cmp_nr2 != -1 || c_cmp_nr3 != -1)
-         {
-             parsed.cmp = new T();
-             
-             if(c_cmp_nr1 != -1)
-             {
-                 parsed.cmp.nr1 = reader[c_cmp_nr1] is <t> p ? p : default;
-             }
-
-             if(c_cmp_nr2 != -1)
-             {
-                 parsed.cmp.nr2 = reader[c_cmp_nr2] is <t> p ? p : default;
-             }
-
-             if(c_cmp_nr3 != -1)
-             {
-                 parsed.cmp.nr3 = reader[c_cmp_nr3] is <t> p ? p : default;
-             }
-         }
-         */
-
-        var requiredCrawler = new RequiredOnlySettablesCrawler(root);
-        var requiredVariables = new List<CrawlerCollected>();
-
-        while(requiredCrawler.Next())
-        {
-            requiredVariables.Add(requiredCrawler.GetVariableAndSource());
-        }
-
-        var anyRequired = requiredVariables.Count > 0;
-
-        if(!anyRequired)
-        {
-
-        }
-    }
-
-    private static ISmthWriter ConcstructParsing(List<CrawlerCollected> variables, ISmthWriter type)
-    {
-        IndentStackWriter writer = null!;
-
-        var rootRequiredSettables = variables.TakeWhile(x => x.IsRoot).Where(x => x.Property.IsRequired).ToList();
-        var other = variables.Where(x => !x.Property.IsRequired).ToList();
-
-        if (rootRequiredSettables.Count != 0)
-        {
-            var parsingInline = rootRequiredSettables.Select(x => $"{x.Property.Name} = reader[{x.VariableName}] is {x.Property.TypeDisplayName} val{x.VariableName} ? val{x.VariableName} : default");
-
-            other.Where(x => x.Depth == 1);
-
-            var f = !other.Any() ? null : new LambdaWriter<object>(null, (_, writer) => writer[$$"""
-                
-                """]
-            );
-
-            new LambdaWriter<IEnumerable<string>>(parsingInline, (parsingInline, writer) => _ = writer[$$"""
-                var parsed = new {{writer.Write(type)}}()
-                {
-                    {{writer.Scope[parsingInline, joinBy: ",\r\n"]}}
-                };
-                """]
-            );
-        }
-
-        return null;
-    }
-
     internal static ISmthWriter ConstructCallIndexesReading(List<CrawlerCollected> variables)
     {
         return new LambdaWriter<List<CrawlerCollected>>(
             variables,
-            (variables, writer) => _ = writer[$"ReadSchemaIndexes<TReader>(TReader reader{writer[variables.Select(x => $", out int {x.VariableName}")]});"]
+            (variables, writer) => _ = writer[$"ReadSchemaIndexes<TReader>(TReader reader{writer[variables.Select(x => $", out int {x.VariableName}"), joinBy: ""]});"]
         );
     }
 
@@ -1045,36 +1086,6 @@ internal static class SettableCrawlerEnumerator2
         }
 #endif
 
-#if false && DEBUG
-        for (int i = 1; slices.Count > 2 && i < slices.Count; i++)
-        {
-            // invalidated due to removal of SiblingIndex
-            /*
-            var itemLinkin = slices.FindIndex(x => x.FirstChildIndex == i || x.SiblingIndex == i);
-            Debug.Assert(itemLinkin >= 0, "There should be a link to an item in some way", "There's no link to item at index: {0}", i);
-            Debug.Assert(slices[i].ParentIndex >= 0, "Every child nodes should have a link to a parent node");
-            */
-
-            // TODO: Fix checks
-            if (false && slices[i].AllRequiredSimpleCount != slices[i].RequiredSimpleCount)
-            {
-                var rootSlice = slices[i];
-
-                var requiredEndSliceIndex = slices.FindIndex(x => !x.IsRequired && x.ParentIndex == i);
-                var requiredEndSlice = slices[requiredEndSliceIndex];
-
-                Debug.Assert(
-                    rootSlice.RequiredSimpleIndex + rootSlice.AllRequiredSimpleCount == requiredEndSlice.RequiredSimpleIndex + requiredEndSlice.RequiredSimpleCount,
-                    "The root element should point to all it's required child elements required primitives",
-                    "Root: start - {0} count - {1}, last required child: start - {2} count - {3}",
-                    rootSlice.RequiredSimpleIndex,
-                    rootSlice.AllRequiredSimpleCount,
-                    requiredEndSlice.RequiredSimpleIndex,
-                    requiredEndSlice.RequiredSimpleCount
-                );
-            }
-        }
-#endif
         return new SettablesCollected(
             slices: slices.AsMemory(),
             requiredPrimitives: allRequiredSimple.AsMemory(),
@@ -1258,7 +1269,6 @@ internal static class SettableCrawlerEnumerator2
         }
     }
 
-    // TODO: passing per settable fails when it comes to complex settable that doesn't have any required settables, but you need to create them anyway
     internal static void PrintParseStep(
         ref ParseStep step,
         ref Span<CrawlerSlice> slices,
@@ -1901,521 +1911,6 @@ internal sealed class BracesWriter(
     }
 }
 
-
-internal sealed class RequiredOnlySettablesCrawler(ModelToParse target)
-{
-    private SettableToParse? _current;
-    private ModelToParse _target = target;
-
-    private IEnumerator<SettableToParse> _settables = target.Settables.Where(x => !x.IsComplex && x.IsRequired).GetEnumerator();
-    private IEnumerator<(SettableToParse link, ModelToParse next)> _complex = EnumerateComplex(target);
-
-    private readonly Stack<CrawlerSection> _pathToCurrent = [];
-    private StringBuilder _variableContainer = new();
-
-    public SettableToParse? Current => _current;
-    public ModelToParse Target => _target;
-
-    public CrawlerCollected GetVariableAndSource()
-    {
-        if (_current == null)
-            return new(default!, default!, default, _target, _current!, _pathToCurrent.Count);
-
-        var variable = GetVariableName();
-        var access = GetFieldAccess();
-        var source = _current.FieldSource;
-
-        return new CrawlerCollected(variable, access, source, _target, _current, _pathToCurrent.Count);
-    }
-
-    public string GetFieldAccess()
-    {
-        _variableContainer.Clear();
-
-        if (_current is null) return string.Empty;
-
-        if (_pathToCurrent.Count == 0) return _current.Name;
-
-        const char chainCell = '.';
-
-        using var enumerator = _pathToCurrent.GetEnumerator();
-
-        if (!enumerator.MoveNext()) return _current.Name;
-
-        try
-        {
-            _variableContainer.Append(enumerator.Current.Link.Name);
-
-            while (enumerator.MoveNext())
-            {
-                _variableContainer
-                    .Append(chainCell)
-                    .Append(enumerator.Current.Link.Name);
-            }
-
-            _variableContainer
-                .Append(chainCell)
-                .Append(_current.Name);
-
-            return _variableContainer.ToString();
-        }
-        finally
-        {
-            _variableContainer.Clear();
-        }
-    }
-
-    public string GetVariableName()
-    {
-        if (_current == null) return string.Empty;
-
-        if (_pathToCurrent.Count == 0)
-        {
-            return $"col{_current.Name}";
-        }
-
-        const string separator = "__";
-
-        _variableContainer.Clear();
-
-        var result = _variableContainer;
-
-        result.Append("col");
-
-        using var enumerator = _pathToCurrent.GetEnumerator();
-
-        enumerator.MoveNext();
-
-        result.Append(enumerator.Current.Link.Name);
-
-        while (enumerator.MoveNext())
-        {
-            result.Append(separator);
-            result.Append(enumerator.Current.Link.Name);
-        }
-
-        result.Append(separator);
-        result.Append(_current.Name);
-
-        var variable = result.ToString();
-
-        result.Clear();
-
-        return variable;
-    }
-
-    [MemberNotNullWhen(true, nameof(_current))]
-    public bool Next()
-    {
-        if (_settables.MoveNext())
-        {
-            _current = _settables.Current;
-            return true;
-        }
-
-        var complex = _complex;
-        var target = _target;
-
-        while (true)
-        {
-            IEnumerator<SettableToParse> settables;
-            SettableToParse link;
-            ModelToParse next;
-
-            if (complex.MoveNext())
-            {
-                (link, next) = complex.Current;
-
-                settables = next.Settables.GetEnumerator();
-
-                if (!settables.MoveNext())
-                {
-                    var nextComplex = EnumerateComplex(next);
-
-                    _pathToCurrent.Push(new(target, link, complex));
-                    (complex, target) = (nextComplex, next);
-
-                    continue;
-                }
-            }
-            else
-            {
-                if (_pathToCurrent.Count == 0)
-                {
-                    return false;
-                }
-
-                var poped = _pathToCurrent.Pop();
-                (target, complex) = (poped.Source, poped.Complex);
-
-                continue;
-            }
-
-            _pathToCurrent.Push(new(target, link, complex));
-            _target = next;
-            _settables = settables;
-            _complex = EnumerateComplex(next);
-            _current = settables.Current;
-
-            return true;
-        }
-    }
-
-    private static IEnumerator<(SettableToParse link, ModelToParse next)> EnumerateComplex(ModelToParse model)
-    {
-        return model.ComplexSettables
-            .Where(x => x.Key.IsRequired)
-            .Select(x => (x.Key, x.Value))
-            .GetEnumerator();
-    }
-}
-
-
-internal sealed class NotRequiredOnlySettablesCrawler(ModelToParse target)
-{
-    private SettableToParse? _current;
-    private ModelToParse _target = target;
-
-    private IEnumerator<SettableToParse> _settables = target.Settables.Where(x => !x.IsComplex && !x.IsRequired).GetEnumerator();
-    private IEnumerator<(SettableToParse link, ModelToParse next)> _complex = EnumerateComplex(target);
-
-    private readonly Stack<CrawlerSection> _pathToCurrent = [];
-    private StringBuilder _variableContainer = new();
-
-    public SettableToParse? Current => _current;
-    public ModelToParse Target => _target;
-
-    public CrawlerCollected GetVariableAndSource()
-    {
-        if (_current == null)
-            return new(default!, default!, default, _target, _current!, _pathToCurrent.Count);
-
-        var variable = GetVariableName();
-        var access = GetFieldAccess();
-        var source = _current.FieldSource;
-
-        return new CrawlerCollected(variable, access, source, _target, _current, _pathToCurrent.Count);
-    }
-
-    public string GetFieldAccess()
-    {
-        _variableContainer.Clear();
-
-        if (_current is null) return string.Empty;
-
-        if (_pathToCurrent.Count == 0) return _current.Name;
-
-        const char chainCell = '.';
-
-        using var enumerator = _pathToCurrent.GetEnumerator();
-
-        if (!enumerator.MoveNext()) return _current.Name;
-
-        try
-        {
-            _variableContainer.Append(enumerator.Current.Link.Name);
-
-            while (enumerator.MoveNext())
-            {
-                _variableContainer
-                    .Append(chainCell)
-                    .Append(enumerator.Current.Link.Name);
-            }
-
-            _variableContainer
-                .Append(chainCell)
-                .Append(_current.Name);
-
-            return _variableContainer.ToString();
-        }
-        finally
-        {
-            _variableContainer.Clear();
-        }
-    }
-
-    public string GetVariableName()
-    {
-        if (_current == null) return string.Empty;
-
-        if (_pathToCurrent.Count == 0)
-        {
-            return $"col{_current.Name}";
-        }
-
-        const string separator = "__";
-
-        _variableContainer.Clear();
-
-        var result = _variableContainer;
-
-        result.Append("col");
-
-        using var enumerator = _pathToCurrent.GetEnumerator();
-
-        enumerator.MoveNext();
-
-        result.Append(enumerator.Current.Link.Name);
-
-        while (enumerator.MoveNext())
-        {
-            result.Append(separator);
-            result.Append(enumerator.Current.Link.Name);
-        }
-
-        result.Append(separator);
-        result.Append(_current.Name);
-
-        var variable = result.ToString();
-
-        result.Clear();
-
-        return variable;
-    }
-
-    [MemberNotNullWhen(true, nameof(_current))]
-    public bool Next()
-    {
-        if (_settables.MoveNext())
-        {
-            _current = _settables.Current;
-            return true;
-        }
-
-        var complex = _complex;
-        var target = _target;
-
-        while (true)
-        {
-            IEnumerator<SettableToParse> settables;
-            SettableToParse link;
-            ModelToParse next;
-
-            if (complex.MoveNext())
-            {
-                (link, next) = complex.Current;
-
-                settables = next.Settables.GetEnumerator();
-
-                if (!settables.MoveNext())
-                {
-                    var nextComplex = EnumerateComplex(next);
-
-                    _pathToCurrent.Push(new(target, link, complex));
-                    (complex, target) = (nextComplex, next);
-
-                    continue;
-                }
-            }
-            else
-            {
-                if (_pathToCurrent.Count == 0)
-                {
-                    return false;
-                }
-
-                var poped = _pathToCurrent.Pop();
-                (target, complex) = (poped.Source, poped.Complex);
-
-                continue;
-            }
-
-            _pathToCurrent.Push(new(target, link, complex));
-            _target = next;
-            _settables = settables;
-            _complex = EnumerateComplex(next);
-            _current = settables.Current;
-
-            return true;
-        }
-    }
-
-    private static IEnumerator<(SettableToParse link, ModelToParse next)> EnumerateComplex(ModelToParse model)
-    {
-        return model.ComplexSettables
-            .Where(x => !x.Key.IsRequired)
-            .Select(x => (x.Key, x.Value))
-            .GetEnumerator();
-    }
-}
-
-
-
-internal sealed class CreationCrawler(ModelToParse target)
-{
-    private SettableToParse? _current;
-    private ModelToParse _target = target;
-
-    private bool _anyRequired = false;
-    private IEnumerator<SettableToParse> _settables = target.Settables.GetEnumerator();
-    private IEnumerator<(SettableToParse link, ModelToParse next)> _complex = EnumerateComplex(target);
-
-    private readonly Stack<CrawlerSection> _pathToCurrent = [];
-    private StringBuilder _variableContainer = new();
-
-    public SettableToParse? Current => _current;
-    public ModelToParse Target => _target;
-
-    public CrawlerCollected GetVariableAndSource()
-    {
-        if (_current == null)
-            return new(default!, default!, default, _target, _current!, _pathToCurrent.Count);
-
-        var variable = GetVariableName();
-        var access = GetFieldAccess();
-        var source = _current.FieldSource;
-
-        return new CrawlerCollected(variable, access, source, _target, _current, _pathToCurrent.Count);
-    }
-
-    public string GetFieldAccess()
-    {
-        _variableContainer.Clear();
-
-        if (_current is null) return string.Empty;
-
-        if (_pathToCurrent.Count == 0) return _current.Name;
-
-        const char chainCell = '.';
-
-        using var enumerator = _pathToCurrent.GetEnumerator();
-
-        if (!enumerator.MoveNext()) return _current.Name;
-
-        try
-        {
-            _variableContainer.Append(enumerator.Current.Link.Name);
-
-            while (enumerator.MoveNext())
-            {
-                _variableContainer
-                    .Append(chainCell)
-                    .Append(enumerator.Current.Link.Name);
-            }
-
-            _variableContainer
-                .Append(chainCell)
-                .Append(_current.Name);
-
-            return _variableContainer.ToString();
-        }
-        finally
-        {
-            _variableContainer.Clear();
-        }
-    }
-
-    public string GetVariableName()
-    {
-        if (_current == null) return string.Empty;
-
-        if (_pathToCurrent.Count == 0)
-        {
-            return $"col{_current.Name}";
-        }
-
-        const string separator = "__";
-
-        _variableContainer.Clear();
-
-        var result = _variableContainer;
-
-        result.Append("col");
-
-        using var enumerator = _pathToCurrent.GetEnumerator();
-
-        enumerator.MoveNext();
-
-        result.Append(enumerator.Current.Link.Name);
-
-        while (enumerator.MoveNext())
-        {
-            result.Append(separator);
-            result.Append(enumerator.Current.Link.Name);
-        }
-
-        result.Append(separator);
-        result.Append(_current.Name);
-
-        var variable = result.ToString();
-
-        result.Clear();
-
-        return variable;
-    }
-
-    public void Move()
-    {
-
-    }
-
-    [MemberNotNullWhen(true, nameof(_current))]
-    public bool Next()
-    {
-        if (_settables.MoveNext())
-        {
-            _current = _settables.Current;
-            return true;
-        }
-
-        var complex = _complex;
-        var target = _target;
-
-        while (true)
-        {
-            IEnumerator<SettableToParse> settables;
-            SettableToParse link;
-            ModelToParse next;
-
-            if (complex.MoveNext())
-            {
-                (link, next) = complex.Current;
-
-                settables = next.Settables.GetEnumerator();
-
-                if (!settables.MoveNext())
-                {
-                    var nextComplex = EnumerateComplex(next);
-
-                    _pathToCurrent.Push(new(target, link, complex));
-                    (complex, target) = (nextComplex, next);
-
-                    continue;
-                }
-            }
-            else
-            {
-                if (_pathToCurrent.Count == 0)
-                {
-                    return false;
-                }
-
-                var poped = _pathToCurrent.Pop();
-                (target, complex) = (poped.Source, poped.Complex);
-
-                continue;
-            }
-
-            _pathToCurrent.Push(new(target, link, complex));
-            _target = next;
-            _settables = settables;
-            _complex = EnumerateComplex(next);
-            _current = settables.Current;
-
-            return true;
-        }
-    }
-
-    private static IEnumerator<(SettableToParse link, ModelToParse next)> EnumerateComplex(ModelToParse model)
-    {
-        return model.ComplexSettables
-            .Where(x => !x.Key.IsRequired)
-            .Select(x => (x.Key, x.Value))
-            .GetEnumerator();
-    }
-}
-
-
 internal sealed class SettableCrawlerEnumerator(ModelToParse target)
 {
     private static IComparer<SettableToParse> _orderRequired = Comparer<SettableToParse>.Create((x, y) =>
@@ -2646,35 +2141,6 @@ internal sealed class TypeToParse
     public required string DisplayName { get; set; }
 }
 
-internal sealed class ReadMethod(
-    ISmthWriter signature,
-    ISmthWriter earlyEscape,
-    ISmthWriter indexesReading,
-    ISmthWriter loopingAndReturning) : ISmthWriter
-{
-    private readonly ISmthWriter _signature = signature;
-    private readonly ISmthWriter _earlyEscape = earlyEscape;
-    private readonly ISmthWriter _indexesReading = indexesReading;
-    private readonly ISmthWriter _loopingAndReturning = loopingAndReturning;
-
-    public void Write(IndentStackWriter writer)
-    {
-        _ = writer[$$"""
-            {{writer.Write(_signature)}}
-            {
-                {{writer.WriteScoped(
-                    [
-                        _earlyEscape,
-                        _indexesReading,
-                        _loopingAndReturning
-                    ]
-                )}}
-            }
-            """
-        ];
-    }
-}
-
 internal sealed class JustStringWriter(string source) : ISmthWriter
 {
     private readonly string _source = source;
@@ -2742,95 +2208,6 @@ internal sealed class ConcatWriter(IEnumerable<ISmthWriter> contents) : ISmthWri
             content.Write(writer);
         }
     }
-}
-
-internal sealed class ReadUnbufferedSync : ISmthWriter
-{
-    private readonly ISmthWriter _signature;
-    private readonly ISmthWriter _indexesReading;
-    private readonly ISmthWriter _parsing;
-
-    private readonly ISmthWriter _parsedName;
-
-    public void Write(IndentStackWriter writer)
-    {
-        _ = writer[$$"""
-            {{writer.WriteScoped(_signature)}}
-            {
-                if(!reader.Read())
-                {
-                    yield break;
-                }
-
-                {{writer.WriteScoped(_indexesReading)}}
-
-                do
-                {
-                    {{writer.WriteScoped(_parsing)}}
-
-                    yield return {{writer.Write(_parsedName)}};
-                } while (reader.Read());
-            }
-            """];
-    }
-}
-
-internal sealed class ReadListSync : ISmthWriter
-{
-    private readonly ISmthWriter _signature;
-    private readonly ISmthWriter _indexesReading;
-    private readonly ISmthWriter _parsing;
-
-    private readonly ISmthWriter _type;
-    private readonly ISmthWriter _parsedName;
-
-    public void Write(IndentStackWriter writer)
-    {
-        _ = writer[$$"""
-            {{writer.Write(_signature)}}
-            {
-                if(!reader.Read())
-                {
-                    yield break;
-                }
-
-                List<{{writer.Write(_type)}}> result = new List<{{writer.Write(_type)}}>();
-
-                {{writer.Write(_indexesReading)}}
-
-                do
-                {
-                    {{writer.Write(_parsing)}}
-
-                    result.Add({{writer.Write(_parsedName)}});
-                } while (reader.Read());
-            }
-            """];
-    }
-}
-
-internal sealed class IncludeNamespaces(IEnumerable<string> namespaces) : ISmthWriter
-{
-    public void Write(IndentStackWriter writer)
-    {
-        _ = writer[namespaces];
-    }
-}
-
-internal sealed class MethodDeclarator : IMethodDeclarator
-{
-    private readonly string _name;
-}
-
-internal sealed class MethodArgument : IMethodArgument
-{
-    private readonly string _name;
-    private readonly string _type;
-    private readonly string _modifiers;
-}
-
-internal sealed class MethodBody : IMethodBody
-{
 }
 
 internal static class WritingsExtension
