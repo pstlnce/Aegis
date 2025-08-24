@@ -9,9 +9,11 @@ using System.Diagnostics.CodeAnalysis;
 using System.Drawing;
 using System.Linq;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace Aegis;
 
@@ -48,7 +50,7 @@ internal static class DifferentWay
 
             var sb = new StringBuilder();
             var wr = new IndentStackWriter(sb);
-            SettableCrawlerEnumerator2.IterateThrough(collected, wr);
+            SettableCrawlerEnumerator2.IterateThrough(collected, wr, token);
 
             var cc = sb.ToString();
 
@@ -642,7 +644,7 @@ internal static class SettableCrawlerEnumerator2
         var optionalComplex = EnumerateOptional(current.ComplexSettables);
 
         var isCurrentRequired = false;
-        var parentLink = new SettableToParse() { FieldSource = default, IsComplex = true, IsRequired = false, Name = "parsed", TypeDisplayName = default };
+        var parentLink = default(SettableToParse);// new SettableToParse() { FieldSource = default, IsComplex = true, IsRequired = false, Name = "parsed", TypeDisplayName = default };
 
         var parentIndex     = -1;
         var defferedCount   = 0;
@@ -1142,7 +1144,7 @@ internal static class SettableCrawlerEnumerator2
         bool isRequired
     )
     {
-        if(!step.Inited && step.RootIndex == sliceIndex)
+        if(!step.Inited)
         {
             if (!step.RootHaveAnyMembers)
             {
@@ -1337,8 +1339,8 @@ internal static class SettableCrawlerEnumerator2
 
             var ccurrent = slices[current.ParentIndex];
 
-            // TODO::
-            while(ccurrent.LastReqRecursiveChildIndex == sliceIndex && ccurrent.ParentIndex > 0)
+            // TODO:: Probably I need to set PreviousParentIndex to the last ParentIndex value after we loop this
+            while(ccurrent.LastReqRecursiveChildIndex == sliceIndex && ccurrent.ParentIndex >= 0)
             {
                 step.Depth -= 1;
                 Debug.Assert(step.Depth >= 0, "Closed more scope braces than opened");
@@ -1354,7 +1356,7 @@ internal static class SettableCrawlerEnumerator2
         step.PreviousIsEmpty = !hasAnyRequired;
     }
 
-    public static void IterateThrough(SettablesCollected collected, IndentStackWriter w)
+    public static void IterateThrough(SettablesCollected collected, IndentStackWriter w, CancellationToken token = default)
     {
 #if true && DEBUG
         var slices   = collected.Slices.Span;
@@ -1372,14 +1374,9 @@ internal static class SettableCrawlerEnumerator2
         ref var first = ref slices[0];
 
         // Main looping
-        for(int i = 0; i < slices.Length; i++)
+        for(int i = 0; i < slices.Length && !token.IsCancellationRequested; i++)
         {
             var root = slices[i];
-
-            if (root.ParentIndex == 3)
-            {
-
-            }
 
             NextAccessPath(column, target: ref root, previous: pprev, slices, separator: "__", initialValue: "");
             NextAccessPath(access, target: ref root, previous: pprev, slices, separator: ".", initialValue: "parsed");
@@ -1393,8 +1390,6 @@ internal static class SettableCrawlerEnumerator2
             // required parts of this model should be already parsed by loop after label "AfterCheck"
             if (root.IsRequired) goto ParsingOptionals;
 
-            depth += 1;
-
             if(i != 0)
             {
                 w.Append("\n\n");
@@ -1402,16 +1397,22 @@ internal static class SettableCrawlerEnumerator2
 
             PrintingStep step = default;
 
+            step.Inited = false;
             step.PreviousParentIndex = root.ParentIndex;
             step.RootIndex = i;
             step.RootHaveRequiredMembers = root.AllRequiredSimpleCount > 0;
             step.RootHaveAnyMembers = root.AllRequiredSimpleCount > 0 || root.AllNotRequiredSimpleCount > 0;
 
+            if(step.RootHaveAnyMembers)
+            {
+                depth += 1;
+            }
+
             // Deciding whether to create or not an object: < - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
             //     - When the type contains any required member then we checking all required primitives                |
             //     - Otherwise whe checking any optional primitive members to have a value in data reader               |
             //         - If we encounter optional complex type then we apply that logic recursively - - - - - - - - - - -
-            
+
             //w.Append("\n\nif(");
 
             //TODO: fix. If root have required primitives, check only them and not any other required members from non-required complex settable
@@ -1663,9 +1664,8 @@ internal static class SettableCrawlerEnumerator2
                     }
 
                     var scopeOwner = slices[root.ParentIndex];
-                    var parentIndex = root.ParentIndex;
                     
-                    while (parentIndex > 0 && scopeOwner.LastRecursiveChildIndex == i)
+                    while (scopeOwner.ParentIndex >= 0 && scopeOwner.LastRecursiveChildIndex == i && !scopeOwner.IsRequired)
                     {
                         w.PopIndent();
                         w.Append("\n}");
@@ -1673,8 +1673,7 @@ internal static class SettableCrawlerEnumerator2
                         depth -= 1;
                         Debug.Assert(depth >= 0);
 
-                        scopeOwner = slices[parentIndex];
-                        parentIndex = scopeOwner.ParentIndex;
+                        scopeOwner = slices[scopeOwner.ParentIndex];
                     }
                 }
             }
@@ -1700,7 +1699,7 @@ internal static class SettableCrawlerEnumerator2
 
     internal static void NextAccessPath(StringBuilder sb, ref CrawlerSlice target, CrawlerSlice previous, Span<CrawlerSlice> slices, string separator, string initialValue)
     {
-        if(target.ParentIndex > previous.ParentIndex)
+        if(false && target.ParentIndex > previous.ParentIndex)
         {
             WindUp(sb, ref target, separator);
         }
@@ -1717,19 +1716,61 @@ internal static class SettableCrawlerEnumerator2
         }
         else if(target.ParentIndex != previous.ParentIndex)
         {
-            Unroll(sb, ref target, previous, slices, separator);
-            WindUp(sb, ref target, separator);
+            if(target.IsRequired && !previous.IsRequired) // it should mean that previous is the parent of the target
+            {
+#if DEBUG
+                Debug.Assert(slices[target.ParentIndex].FirstRequiredChildIndex == target.ParentIndex + 1);
+                Debug.Assert(slices[target.ParentIndex].ParentLink == previous.ParentLink);
+#endif
+                WindUp(sb, ref target, separator);
+            }
+            else if(target.IsRequired && previous.IsRequired && target.ParentIndex > previous.ParentIndex)
+            {
+                WindUp(sb, ref target, separator);
+            }
+            else if(target.IsRequired && previous.IsRequired)
+            {
+                Unroll(sb, ref target, previous, slices, separator);
+                WindUp(sb, ref target, separator);
+            }
+            else
+            {
+                Debug.Assert(!target.IsRequired);
+
+                sb.Clear();
+                WindUpFromZero(slices, sb, parentIndex: target.ParentIndex, separator: separator);
+                WindUp(sb, ref target, separator);
+            }
         }
     }
 
     internal static void WindUp(StringBuilder sb, ref CrawlerSlice target, string separator)
     {
+        if(target.ParentIndex == -1)
+        {
+            return;
+        }
+
         if(sb.Length != 0)
         {
             sb.Append(separator);
         }
 
         sb.Append(target.ParentLink.Name);
+    }
+
+    internal static void WindUpFromZero(Span<CrawlerSlice> slices, StringBuilder sb, int parentIndex, string separator)
+    {
+        if (parentIndex <= 0) return;
+
+        WindUpFromZero(slices, sb, slices[parentIndex].ParentIndex, separator);
+
+        if(sb.Length != 0)
+        {
+            sb.Append(separator);
+        }
+
+        sb.Append(slices[parentIndex].ParentLink.Name);
     }
 
     internal static void Unroll(StringBuilder sb, ref CrawlerSlice target, CrawlerSlice previous, Span<CrawlerSlice> slices, string separator)
